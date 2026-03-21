@@ -201,9 +201,21 @@ impl ApuThread {
     }
 
     fn chase_clock_for_wave_read(&mut self) {
-        // For wave RAM reads: advance 2 extra T-cycles to account for the
-        // read M-cycle cost that the CPU hasn't counted yet.
-        let target = self.clock.target() + 3;
+        // For wave RAM reads: stop 6 T-cycles behind to align with the
+        // M-cycle where the CPU actually performs the read.
+        let target = self.clock.target().saturating_sub(6);
+        while self.cycles < target {
+            if self.master_enable {
+                self.tick();
+            }
+            self.cycles += 1;
+        }
+    }
+
+    fn chase_clock_for_wave_write(&mut self) {
+        // For wave RAM writes: stop 4 T-cycles behind, then use
+        // last_access_cycle to check the access window.
+        let target = self.clock.target().saturating_sub(4);
         while self.cycles < target {
             if self.master_enable {
                 self.tick();
@@ -236,7 +248,16 @@ impl ApuThread {
                 value,
                 respond_to,
             } => {
-                self.chase_clock();
+                if matches!(address, 0xff30..=0xff3f)
+                    && matches!(
+                        self.hardware_mode,
+                        super::component::HardwareMode::DmgCompatibility
+                    )
+                {
+                    self.chase_clock_for_wave_write();
+                } else {
+                    self.chase_clock();
+                }
                 self.write_register(address, value);
                 if let Some(respond_to) = respond_to {
                     let _ = respond_to.send(WriteResult::Accepted);
@@ -268,9 +289,8 @@ impl ApuThread {
                         // DMG: CPU can only read wave RAM on the cycle CH3 accesses it.
                         // Approximate by checking if the period timer just expired.
                         if self.channel3.period_timer <= 2 {
-                            ReadResult::Ready(
-                                self.wave_ram[(self.channel3.sample_index / 2) as usize],
-                            )
+                            let idx = (self.channel3.sample_index.wrapping_add(1)) & 31;
+                            ReadResult::Ready(self.wave_ram[(idx / 2) as usize])
                         } else {
                             ReadResult::Ready(0xff)
                         }
@@ -339,9 +359,20 @@ impl ApuThread {
             }
             0xff30..=0xff3f => {
                 if self.channel3.enabled {
-                    // CGB: writing wave RAM while CH3 is active writes to
-                    // the byte CH3 is currently reading.
-                    self.wave_ram[(self.channel3.sample_index / 2) as usize] = value;
+                    if matches!(
+                        self.hardware_mode,
+                        super::component::HardwareMode::DmgCompatibility
+                    ) {
+                        // DMG: write redirects to the byte CH3 is reading, but only
+                        // during the brief cycle when wave RAM is being accessed.
+                        let since_access = self.cycles.wrapping_sub(self.channel3.last_access_cycle);
+                        if since_access <= 2 {
+                            self.wave_ram[(self.channel3.sample_index / 2) as usize] = value;
+                        }
+                    } else {
+                        // CGB: always writes to the byte CH3 is currently reading.
+                        self.wave_ram[(self.channel3.sample_index / 2) as usize] = value;
+                    }
                 } else {
                     self.wave_ram[(address - 0xff30) as usize] = value;
                 }
@@ -580,8 +611,8 @@ impl ApuThread {
     }
 
     fn trigger_channel3(&mut self) {
-        // DMG: retriggering while CH3 is active AND the timer is about to
-        // expire (within 2 T-cycles of a wave RAM read) corrupts wave RAM.
+        // DMG: retriggering while CH3 is active AND the timer is near
+        // expiry corrupts wave RAM.
         if matches!(
             self.hardware_mode,
             super::component::HardwareMode::DmgCompatibility
@@ -603,6 +634,7 @@ impl ApuThread {
             }
         }
 
+        let was_playing = self.channel3.enabled;
         let ch = &mut self.channel3;
         ch.enabled = ch.dac_enabled;
         if ch.length_timer == 0 {
@@ -611,9 +643,7 @@ impl ApuThread {
                 ch.length_timer -= 1;
             }
         }
-        // Timer reloads on trigger. Offset compensates for the trigger
-        // happening at the end of the write M-cycle. DMG and CGB differ.
-        let trigger_delay = if matches!(
+        let trigger_delay: u16 = if matches!(
             self.hardware_mode,
             super::component::HardwareMode::DmgCompatibility
         ) {
@@ -621,7 +651,9 @@ impl ApuThread {
         } else {
             6
         };
+        // Always reload timer on trigger (both initial and retrigger).
         ch.period_timer = (2048 - ch.period) * 2 + trigger_delay;
+        let _ = was_playing;
         ch.sample_index = 0;
     }
 
@@ -710,6 +742,10 @@ impl ApuThread {
 
         // Wave channel: period is pre-scaled by 2 for the 2 MHz tick rate.
         self.channel3.tick_period(&self.wave_ram);
+        if self.channel3.just_accessed_ram {
+            self.channel3.last_access_cycle = self.cycles;
+            self.channel3.just_accessed_ram = false;
+        }
 
         // Noise channel: ticks at variable rate via period timer.
         self.channel4.tick_period();

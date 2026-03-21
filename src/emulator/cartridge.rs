@@ -489,16 +489,23 @@ impl CartridgeThread {
             unsupported => return Err(CartridgeLoadError::UnsupportedMbc(unsupported)),
         };
 
-        let mut ram = vec![0; image.metadata.ram_size];
+        // MBC1 hardware supports RAM even when the header doesn't declare it.
+        // Provide at least 8KB for compatibility with test ROMs and games.
+        let mut metadata = image.metadata;
+        if matches!(metadata.mbc, MbcKind::Mbc1) && metadata.ram_size == 0 {
+            metadata.ram_size = RAM_WINDOW_SIZE;
+            metadata.ram_bank_count = 1;
+        }
+        let mut ram = vec![0; metadata.ram_size];
         if !ram.is_empty() {
             let mut rng = StdRng::seed_from_u64(boot_seed ^ 0x5eed_cafe_dead_beef);
             rng.fill_bytes(&mut ram);
         }
 
         // Load battery-backed save if present.
-        if image.metadata.has_battery() {
+        if metadata.has_battery() {
             if let Some(path) = &save_path {
-                load_save_file(path, &mut ram, &mut controller, &image.metadata);
+                load_save_file(path, &mut ram, &mut controller, &metadata);
             }
         }
 
@@ -506,7 +513,7 @@ impl CartridgeThread {
             boot_rom,
             boot_rom_mapped: true,
             ram,
-            metadata: image.metadata,
+            metadata,
             controller,
             shared_read_state,
             rom: image.rom,
