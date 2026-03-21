@@ -1,0 +1,16 @@
+# Chudtendo keybindings
+#
+# Maps key names to Game Boy buttons.
+# Key names are case-insensitive and must match SDL2 keycode names
+# (e.g. "A", "Z", "Return", "Backspace", "Up", "Space", "Tab").
+#
+# Game Boy buttons: right, left, up, down, a, b, select, start
+
+up: up
+down: down
+left: left
+right: right
+z: a
+x: b
+backspace: select
+return: start

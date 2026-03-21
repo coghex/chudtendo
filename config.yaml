@@ -1,0 +1,7 @@
+# Chudtendo configuration
+#
+# Boot ROM paths (relative to project root or absolute).
+# Download the appropriate boot ROMs and place them at these paths.
+
+cgb_boot_rom: data/cgb_boot.bin
+dmg_boot_rom: data/dmg_boot.bin
