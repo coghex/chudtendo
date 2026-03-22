@@ -986,7 +986,10 @@ impl PpuThread {
 
     fn render_scanline(&mut self, y: usize) {
         let registers = self.scanline_registers[y];
-        let bg_enabled = registers.lcdc & LCDC_BG_ENABLE_MASK != 0;
+        // On CGB, LCDC bit 0 is "Master Priority" — BG is always rendered,
+        // only sprite priority changes.  On DMG, bit 0 actually disables BG.
+        let bg_enabled = matches!(self.hardware_mode, HardwareMode::Cgb)
+            || registers.lcdc & LCDC_BG_ENABLE_MASK != 0;
         let mut bg_pixels = [BgPixel::default(); SCREEN_WIDTH];
         let window_line = self.window_line;
         let mut window_used = false;
@@ -1050,6 +1053,15 @@ impl PpuThread {
             }
         }
 
+        // DMG: sprite priority is by X coordinate (lower X = on top),
+        // ties broken by OAM position. CGB: strictly by OAM position.
+        if !matches!(self.hardware_mode, HardwareMode::Cgb) {
+            visible[..visible_count].sort_by_key(|&i| {
+                let x = self.rendering_oam[i * OAM_ENTRY_SIZE + 1];
+                (x, i as u8)
+            });
+        }
+
         for &sprite_index in visible[..visible_count].iter().rev() {
             self.render_sprite_on_scanline(sprite_index, y, sprite_height, bg_pixels, registers);
         }
@@ -1109,7 +1121,7 @@ impl PpuThread {
 
             let framebuffer_index = y * SCREEN_WIDTH + screen_x as usize;
             let bg_pixel = bg_pixels[screen_x as usize];
-            if self.sprite_hidden_by_background(attributes, bg_pixel) {
+            if self.sprite_hidden_by_background(attributes, bg_pixel, registers.lcdc) {
                 continue;
             }
 
@@ -1281,8 +1293,13 @@ impl PpuThread {
         }
     }
 
-    fn sprite_hidden_by_background(&self, attributes: u8, bg_pixel: BgPixel) -> bool {
+    fn sprite_hidden_by_background(&self, attributes: u8, bg_pixel: BgPixel, lcdc: u8) -> bool {
         if matches!(self.hardware_mode, HardwareMode::Cgb) {
+            // CGB: when LCDC bit 0 (Master Priority) is cleared, sprites
+            // always appear on top regardless of BG/OAM priority flags.
+            if lcdc & LCDC_BG_ENABLE_MASK == 0 {
+                return false;
+            }
             bg_pixel.color_index != 0
                 && (bg_pixel.priority || attributes & SPRITE_ATTR_PRIORITY_MASK != 0)
         } else {
