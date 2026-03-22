@@ -624,6 +624,140 @@ impl Emulator {
 
         Ok(())
     }
+
+    // --- Headless agent API ---
+
+    /// Mute audio by dropping the sample receiver. The APU's `try_send`
+    /// silently fails on the disconnected channel, so no samples accumulate
+    /// and the APU thread never blocks.
+    pub fn mute_audio(&mut self) {
+        self.sample_ready.take();
+    }
+
+    /// Drain any pending audio samples without playing them.
+    /// Returns the number of samples drained.
+    pub fn drain_audio(&mut self) -> usize {
+        let mut count = 0;
+        if let Some(rx) = &self.sample_ready {
+            while rx.try_recv().is_ok() {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Block until the PPU has rendered at least `n` frames beyond the
+    /// current count, draining reports along the way. Returns the snapshot
+    /// after the target frame is reached.
+    pub fn run_frames(&mut self, n: u64) -> Snapshot {
+        let snap = self.snapshot();
+        let target = snap.ppu_frames + n;
+        loop {
+            let snap = self.snapshot();
+            if snap.ppu_frames >= target {
+                return snap;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Read a contiguous range of memory addresses.
+    /// Useful for bulk reads of VRAM (0x8000-0x9FFF), OAM (0xFE00-0xFE9F), etc.
+    pub fn read_range(&self, start: u16, len: u16) -> Vec<u8> {
+        let mut data = Vec::with_capacity(len as usize);
+        for offset in 0..len {
+            let addr = start.wrapping_add(offset);
+            let mut pending = self.bus.read(addr);
+            loop {
+                if let Some(result) = pending.try_take() {
+                    data.push(match result {
+                        ReadResult::Ready(v) => v,
+                        ReadResult::NoData => 0xff,
+                    });
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
+        data
+    }
+
+    /// Read the 40 OAM sprite entries as structured data.
+    /// Each entry: (y, x, tile_index, attributes).
+    pub fn oam_entries(&self) -> Vec<OamEntry> {
+        let raw = self.read_range(0xfe00, 160);
+        raw.chunks_exact(4)
+            .map(|e| OamEntry {
+                y: e[0],
+                x: e[1],
+                tile: e[2],
+                flags: e[3],
+            })
+            .collect()
+    }
+
+    /// Read the background tile map (32x32 tile indices).
+    /// `map_select`: false = 0x9800, true = 0x9C00 (LCDC bit 3).
+    pub fn tile_map(&self, map_select: bool) -> Vec<u8> {
+        let base = if map_select { 0x9c00 } else { 0x9800 };
+        self.read_range(base, 1024)
+    }
+
+    /// Read the current LCD register values (LCDC, STAT, SCY, SCX, LY, LYC,
+    /// DMA, BGP, OBP0, OBP1, WY, WX) as a compact struct.
+    pub fn lcd_registers(&self) -> LcdRegisters {
+        let raw = self.read_range(0xff40, 12);
+        LcdRegisters {
+            lcdc: raw[0],
+            stat: raw[1],
+            scy: raw[2],
+            scx: raw[3],
+            ly: raw[4],
+            lyc: raw[5],
+            dma: raw[6],
+            bgp: raw[7],
+            obp0: raw[8],
+            obp1: raw[9],
+            wy: raw[10],
+            wx: raw[11],
+        }
+    }
+}
+
+/// A single OAM sprite entry.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OamEntry {
+    pub y: u8,
+    pub x: u8,
+    pub tile: u8,
+    pub flags: u8,
+}
+
+impl OamEntry {
+    pub fn screen_x(&self) -> i16 { self.x as i16 - 8 }
+    pub fn screen_y(&self) -> i16 { self.y as i16 - 16 }
+    pub fn x_flip(&self) -> bool { self.flags & 0x20 != 0 }
+    pub fn y_flip(&self) -> bool { self.flags & 0x40 != 0 }
+    pub fn behind_bg(&self) -> bool { self.flags & 0x80 != 0 }
+    pub fn cgb_palette(&self) -> u8 { self.flags & 0x07 }
+    pub fn cgb_vram_bank(&self) -> u8 { (self.flags >> 3) & 1 }
+}
+
+/// LCD register snapshot.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LcdRegisters {
+    pub lcdc: u8,
+    pub stat: u8,
+    pub scy: u8,
+    pub scx: u8,
+    pub ly: u8,
+    pub lyc: u8,
+    pub dma: u8,
+    pub bgp: u8,
+    pub obp0: u8,
+    pub obp1: u8,
+    pub wy: u8,
+    pub wx: u8,
 }
 
 fn trace_report_drain(context: &str, duration: Duration, stats: ReportDrainStats) {
