@@ -180,6 +180,21 @@ fn cgb_acid2() {
 }
 
 #[test]
+fn mbc3_tester() {
+    let dir = acid2_dir();
+    let rom = dir.join("mbc3-tester").join("mbc3-tester.gb");
+    let reference = dir.join("mbc3-tester").join("mbc3-tester-cgb.png");
+    if !rom.exists() {
+        eprintln!("skipping mbc3-tester: ROM not found");
+        return;
+    }
+
+    let fb = run_and_capture(&rom, 10); // MBC3 tester takes longer
+    let ref_fb = load_reference_png(&reference);
+    compare_framebuffers(&fb, &ref_fb, "mbc3-tester");
+}
+
+#[test]
 fn dmg_acid2() {
     let dir = acid2_dir();
     let rom = dir.join("dmg-acid2").join("dmg-acid2.gb");

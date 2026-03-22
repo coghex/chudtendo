@@ -967,8 +967,10 @@ impl CpuThread {
                 let armed_bit = if self.speed_switch_armed { 0x01 } else { 0x00 };
                 Some(0x7e | speed_bit | armed_bit)
             }
-            0xff01 | 0xff02 => {
-                Some(self.io_registers[(address - 0xff00) as usize])
+            0xff01 => Some(self.io_registers[0x01]),
+            0xff02 => {
+                // SC: bits 2-6 are unused and read as 1.
+                Some(self.io_registers[0x02] | 0x7c)
             }
             0xff0f => Some(0xe0 | self.interrupt_flags.load()),
             0xff03 | 0xff08..=0xff0e | 0xff27..=0xff2f | 0xff4e
