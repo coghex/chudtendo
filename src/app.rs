@@ -10,6 +10,7 @@ use sdl2::video::Window;
 
 use crate::emulator::{CartridgeMetadata, Emulator, SCREEN_HEIGHT, SCREEN_WIDTH, Snapshot};
 use crate::input::Keybindings;
+use crate::shader::Shader;
 
 const WINDOW_SCALE: u32 = 4;
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
@@ -103,10 +104,11 @@ pub fn run(run_mode: RunMode, rom_path: Option<&Path>, dmg_mode: bool) -> Result
         None
     };
 
+    let shader = load_shader();
     let keybindings = Keybindings::load_or_default(Path::new("keybindings.yaml"));
     let joypad = emulator.joypad().clone();
     let initial_snapshot = wait_for_live_snapshot(&mut emulator, Duration::from_millis(100));
-    upload_framebuffer(&mut texture, &initial_snapshot.framebuffer)?;
+    upload_framebuffer(&mut texture, &initial_snapshot.framebuffer, &shader)?;
     draw_frame(&mut canvas, &texture)?;
 
     let mut event_pump = sdl
@@ -196,7 +198,7 @@ pub fn run(run_mode: RunMode, rom_path: Option<&Path>, dmg_mode: bool) -> Result
                 last_snapshot_frame = frame.frame;
             }
             let upload_started = Instant::now();
-            upload_framebuffer(&mut texture, &frame.framebuffer)?;
+            upload_framebuffer(&mut texture, &frame.framebuffer, &shader)?;
             trace_app_stage("upload", frame.frame, upload_started.elapsed());
             last_uploaded_frame = frame.frame;
             emulator.recycle_framebuffer(frame.framebuffer);
@@ -245,7 +247,7 @@ fn run_smoke_frames(
         let snapshot = emulator.snapshot();
         saw_activity |=
             snapshot.cpu_steps != 0 || snapshot.ppu_frames != 0 || snapshot.timer_ticks != 0;
-        upload_framebuffer(texture, &snapshot.framebuffer)?;
+        upload_framebuffer(texture, &snapshot.framebuffer, &Shader::identity())?;
         draw_frame(canvas, texture)?;
 
         if saw_activity {
@@ -321,7 +323,7 @@ fn duration_abs_diff(left: Duration, right: Duration) -> Duration {
     left.abs_diff(right)
 }
 
-fn upload_framebuffer(texture: &mut Texture<'_>, framebuffer: &[u8]) -> Result<(), String> {
+fn upload_framebuffer(texture: &mut Texture<'_>, framebuffer: &[u8], shader: &Shader) -> Result<(), String> {
     texture
         .with_lock(None, |pixels, pitch| {
             let row_width = SCREEN_WIDTH * 4;
@@ -329,9 +331,38 @@ fn upload_framebuffer(texture: &mut Texture<'_>, framebuffer: &[u8]) -> Result<(
             for (row_index, row) in framebuffer.chunks_exact(row_width).enumerate() {
                 let offset = row_index * pitch;
                 pixels[offset..offset + row_width].copy_from_slice(row);
+                // Apply shader in-place on the texture row.
+                shader.apply(&mut pixels[offset..offset + row_width]);
             }
         })
         .map_err(|error| format!("failed to upload framebuffer: {error}"))
+}
+
+fn load_shader() -> Shader {
+    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.yaml");
+    let shader_path = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|contents| {
+            let config: std::collections::HashMap<String, String> =
+                serde_yaml::from_str(&contents).ok()?;
+            config.get("shader").map(|s| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(s)
+            })
+        });
+
+    match shader_path {
+        Some(path) => match Shader::load(&path) {
+            Ok(shader) => {
+                eprintln!("Shader loaded: {} ({})", shader.name, path.display());
+                shader
+            }
+            Err(e) => {
+                eprintln!("Warning: {e}, using identity shader");
+                Shader::identity()
+            }
+        },
+        None => Shader::identity(),
+    }
 }
 
 fn draw_frame(

@@ -1,0 +1,13 @@
+# Raw Output (No Correction)
+#
+# Identity matrix — passes colors through unmodified.
+
+name: Raw
+
+color_matrix:
+  r: [1.0, 0.0, 0.0]
+  g: [0.0, 1.0, 0.0]
+  b: [0.0, 0.0, 1.0]
+
+gamma: 1.0
+brightness: 1.0

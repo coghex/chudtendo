@@ -1,0 +1,18 @@
+# CGB LCD Color Correction
+#
+# Models the Game Boy Color's LCD response. The CGB screen displays
+# colors darker and warmer than raw RGB, with slight bleed between
+# channels.
+#
+# Applied directly to sRGB values (no gamma round-trip) since the
+# PPU's expand_color output is already in sRGB space.
+
+name: CGB LCD
+
+color_matrix:
+  r: [0.78, 0.12, -0.02]
+  g: [0.05, 0.72,  0.10]
+  b: [0.04, 0.08,  0.68]
+
+gamma: 1.0
+brightness: 0.92

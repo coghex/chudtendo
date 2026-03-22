@@ -5,3 +5,7 @@
 
 cgb_boot_rom: data/cgb_boot.bin
 dmg_boot_rom: data/dmg_boot.bin
+
+# Software shader for color correction.
+# Set to "shaders/raw.yaml" for unmodified output.
+shader: shaders/cgb_lcd.yaml
