@@ -142,6 +142,10 @@ pub struct ApuThread {
     sample_counter: u32,
     samples_emitted: u64,
     sample_sender: SyncSender<[f32; 2]>,
+    /// First-order high-pass filter state (capacitor coupling).
+    /// Removes DC offset, matching the Game Boy's analog output stage.
+    hpf_left: f32,
+    hpf_right: f32,
 }
 
 struct PulseChannel {
@@ -234,6 +238,8 @@ impl ApuThread {
             sample_counter: 0,
             samples_emitted: 0,
             sample_sender,
+            hpf_left: 0.0,
+            hpf_right: 0.0,
         }
     }
 
@@ -1105,8 +1111,17 @@ impl ApuThread {
         left = (left / 4.0) * (left_vol / 8.0);
         right = (right / 4.0) * (right_vol / 8.0);
 
+        // High-pass filter: models the Game Boy's capacitor-coupled output.
+        // Removes DC offset that causes buzzing during quiet passages.
+        // Charge factor ~0.998 gives a ~20 Hz cutoff at 48 kHz sample rate.
+        const CHARGE_FACTOR: f32 = 0.998;
+        let hpf_left_out = left - self.hpf_left;
+        self.hpf_left += hpf_left_out * (1.0 - CHARGE_FACTOR);
+        let hpf_right_out = right - self.hpf_right;
+        self.hpf_right += hpf_right_out * (1.0 - CHARGE_FACTOR);
+
         self.samples_emitted += 1;
-        let _ = self.sample_sender.try_send([left, right]);
+        let _ = self.sample_sender.try_send([hpf_left_out, hpf_right_out]);
     }
 }
 
