@@ -181,10 +181,9 @@ impl PpuThread {
 
             let target = self.clock.target();
             if self.dots < target {
-                if !self.advance_ppu(&inbox) {
+                if !self.advance_ppu(&inbox, target) {
                     break;
                 }
-                self.dots += PPU_DOTS_PER_SAMPLE as u64;
                 self.advance_oam_dma();
                 self.refill_spare_framebuffer();
                 self.publish_report_if_needed(&reports);
@@ -569,12 +568,14 @@ impl PpuThread {
         }
     }
 
-    fn advance_ppu(&mut self, inbox: &Receiver<Command>) -> bool {
-        for _ in 0..PPU_DOTS_PER_SAMPLE {
+    fn advance_ppu(&mut self, inbox: &Receiver<Command>, target: u64) -> bool {
+        let end = std::cmp::min(self.dots + PPU_DOTS_PER_SAMPLE as u64, target);
+        while self.dots < end {
             if !self.service_inbox(inbox) {
                 return false;
             }
             self.step_dot();
+            self.dots += 1;
         }
         true
     }

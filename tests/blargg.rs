@@ -137,19 +137,6 @@ fn collect_serial_output(serial_rx: &Receiver<u8>, emulator: &mut Emulator) -> T
         }
 
         if start.elapsed() >= TEST_TIMEOUT {
-            let snap = emulator.status_snapshot();
-            eprintln!(
-                "TIMEOUT: pc={:04x} steps={} frames={} timer={} sram_sig={:?}",
-                snap.cpu_pc,
-                snap.cpu_steps,
-                snap.ppu_frames,
-                snap.timer_ticks,
-                (
-                    try_read(emulator, 0xa001),
-                    try_read(emulator, 0xa002),
-                    try_read(emulator, 0xa003),
-                ),
-            );
             return TestResult {
                 output,
                 passed: false,
@@ -359,7 +346,7 @@ fn mem_timing2_03_modify() {
 
 #[test]
 fn halt_bug() {
-    assert_blargg_pass("halt_bug.gb");
+    assert_blargg_pass_dmg("halt_bug.gb");
 }
 
 // --- DMG sound ---
