@@ -1,11 +1,25 @@
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::thread;
 
+use serde::{Deserialize, Serialize};
+
 use super::bus::Bus;
 use super::component::{
     Command, ComponentReport, InterruptFlags, MasterClock, MemoryCommand, ReadResult,
     TimerInitState, TimerReport, WriteResult,
 };
+
+#[derive(Serialize, Deserialize)]
+pub struct TimerSaveState {
+    pub div: u8,
+    pub tima: u8,
+    pub tma: u8,
+    pub tac: u8,
+    pub ticks: u64,
+    pub cycles: u64,
+    pub system_counter: u16,
+    pub pending_reload: bool,
+}
 
 const TIMER_CLOCKS_PER_SAMPLE: u16 = 4;
 const TIMER_INTERRUPT_MASK: u8 = 0x04;
@@ -82,11 +96,45 @@ impl TimerThread {
             match inbox.try_recv() {
                 Ok(Command::Memory(command)) => self.handle_memory(command),
                 Ok(Command::SetHardwareMode(_)) => {}
+                Ok(Command::SaveState(respond_to)) => {
+                    let state = self.create_save_state();
+                    let bytes = bincode::serialize(&state).unwrap_or_default();
+                    let _ = respond_to.send(bytes);
+                }
+                Ok(Command::LoadState(bytes)) => {
+                    if let Ok(state) = bincode::deserialize::<TimerSaveState>(&bytes) {
+                        self.apply_save_state(state);
+                    }
+                }
                 Ok(Command::Stop) => return false,
                 Err(TryRecvError::Empty) => return true,
                 Err(TryRecvError::Disconnected) => return false,
             }
         }
+    }
+
+    fn create_save_state(&self) -> TimerSaveState {
+        TimerSaveState {
+            div: self.div,
+            tima: self.tima,
+            tma: self.tma,
+            tac: self.tac,
+            ticks: self.ticks,
+            cycles: self.cycles,
+            system_counter: self.system_counter,
+            pending_reload: self.pending_reload,
+        }
+    }
+
+    fn apply_save_state(&mut self, state: TimerSaveState) {
+        self.div = state.div;
+        self.tima = state.tima;
+        self.tma = state.tma;
+        self.tac = state.tac;
+        self.ticks = state.ticks;
+        self.cycles = state.cycles;
+        self.system_counter = state.system_counter;
+        self.pending_reload = state.pending_reload;
     }
 
     fn handle_memory(&mut self, command: MemoryCommand) {

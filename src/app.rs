@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use sdl2::audio::{AudioCallback, AudioSpecDesired};
 use sdl2::event::Event;
-use sdl2::keyboard::Keycode;
+use sdl2::keyboard::{Keycode, Mod};
 use sdl2::pixels::{Color, PixelFormatEnum};
 use sdl2::render::Texture;
 use sdl2::video::Window;
@@ -129,10 +129,37 @@ pub fn run(run_mode: RunMode, rom_path: Option<&Path>, dmg_mode: bool) -> Result
                 } => break 'running,
                 Event::KeyDown {
                     keycode: Some(keycode),
+                    keymod,
                     repeat: false,
                     ..
                 } => {
-                    if let Some(button) = keybindings.lookup(&sdl_key_name(keycode)) {
+                    // F1-F8: save state; Shift+F1-F8: load state.
+                    let fkey_slot = match keycode {
+                        Keycode::F1 => Some(1u8),
+                        Keycode::F2 => Some(2),
+                        Keycode::F3 => Some(3),
+                        Keycode::F4 => Some(4),
+                        Keycode::F5 => Some(5),
+                        Keycode::F6 => Some(6),
+                        Keycode::F7 => Some(7),
+                        Keycode::F8 => Some(8),
+                        _ => None,
+                    };
+                    if let Some(slot) = fkey_slot {
+                        let shift =
+                            keymod.contains(Mod::LSHIFTMOD) || keymod.contains(Mod::RSHIFTMOD);
+                        if shift {
+                            match emulator.load_state(slot) {
+                                Ok(()) => eprintln!("Loaded state {slot}"),
+                                Err(e) => eprintln!("Load failed: {e}"),
+                            }
+                        } else {
+                            match emulator.save_state(slot) {
+                                Ok(()) => eprintln!("Saved state {slot}"),
+                                Err(e) => eprintln!("Save failed: {e}"),
+                            }
+                        }
+                    } else if let Some(button) = keybindings.lookup(&sdl_key_name(keycode)) {
                         joypad.press(button);
                     }
                 }

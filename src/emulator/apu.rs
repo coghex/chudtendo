@@ -1,10 +1,87 @@
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError};
 use std::thread;
 
+use serde::{Deserialize, Serialize};
+
 use super::component::{
-    ApuReport, CPU_CLOCK_HZ, Command, ComponentReport, MasterClock, MemoryCommand, ReadResult,
-    WriteResult,
+    ApuReport, CPU_CLOCK_HZ, Command, ComponentReport, HardwareMode, MasterClock, MemoryCommand,
+    ReadResult, WriteResult,
 };
+
+#[derive(Serialize, Deserialize)]
+pub struct PulseChannelSave {
+    pub enabled: bool,
+    pub dac_enabled: bool,
+    pub duty: u8,
+    pub duty_position: u8,
+    pub length_timer: u16,
+    pub length_enabled: bool,
+    pub volume: u8,
+    pub envelope_direction: bool,
+    pub envelope_pace: u8,
+    pub envelope_timer: u8,
+    pub period: u16,
+    pub period_timer: u16,
+    pub sweep_enabled: bool,
+    pub sweep_pace: u8,
+    pub sweep_direction: bool,
+    pub sweep_step: u8,
+    pub sweep_timer: u8,
+    pub sweep_shadow: u16,
+    pub sweep_negate_used: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct WaveChannelSave {
+    pub enabled: bool,
+    pub dac_enabled: bool,
+    pub length_timer: u16,
+    pub length_enabled: bool,
+    pub output_level: u8,
+    pub period: u16,
+    pub period_timer: u16,
+    pub sample_index: u8,
+    pub sample_buffer: u8,
+    pub just_accessed_ram: bool,
+    pub last_access_cycle: u64,
+    pub last_access_sample_index: u8,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct NoiseChannelSave {
+    pub enabled: bool,
+    pub dac_enabled: bool,
+    pub length_timer: u16,
+    pub length_enabled: bool,
+    pub volume: u8,
+    pub envelope_direction: bool,
+    pub envelope_pace: u8,
+    pub envelope_timer: u8,
+    pub clock_shift: u8,
+    pub width_mode: bool,
+    pub divisor_code: u8,
+    pub lfsr: u16,
+    pub period_timer: u16,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ApuSaveState {
+    pub master_enable: bool,
+    pub nr50: u8,
+    pub nr51: u8,
+    pub registers: Vec<u8>,
+    pub channel1: PulseChannelSave,
+    pub channel2: PulseChannelSave,
+    pub channel3: WaveChannelSave,
+    pub channel4: NoiseChannelSave,
+    pub wave_ram: Vec<u8>,
+    pub frame_sequencer_step: u8,
+    pub frame_sequencer_counter: u32,
+    pub sample_counter: u32,
+    pub samples_emitted: u64,
+    pub cycles: u64,
+    pub hardware_mode: HardwareMode,
+}
 
 const CPU_CLOCK: u32 = CPU_CLOCK_HZ as u32;
 const SAMPLE_RATE: u32 = 48_000;
@@ -191,11 +268,185 @@ impl ApuThread {
             match inbox.try_recv() {
                 Ok(Command::Memory(command)) => self.handle_memory(command),
                 Ok(Command::SetHardwareMode(mode)) => self.hardware_mode = mode,
+                Ok(Command::SaveState(respond_to)) => {
+                    let state = self.create_save_state();
+                    let bytes = bincode::serialize(&state).unwrap_or_default();
+                    let _ = respond_to.send(bytes);
+                }
+                Ok(Command::LoadState(bytes)) => {
+                    if let Ok(state) = bincode::deserialize::<ApuSaveState>(&bytes) {
+                        self.apply_save_state(state);
+                    }
+                }
                 Ok(Command::Stop) => return InboxResult::Stop,
                 Err(TryRecvError::Empty) => return InboxResult::Continue,
                 Err(TryRecvError::Disconnected) => return InboxResult::Stop,
             }
         }
+    }
+
+    fn create_save_state(&self) -> ApuSaveState {
+        ApuSaveState {
+            master_enable: self.master_enable,
+            nr50: self.nr50,
+            nr51: self.nr51,
+            registers: self.registers.to_vec(),
+            channel1: PulseChannelSave {
+                enabled: self.channel1.enabled,
+                dac_enabled: self.channel1.dac_enabled,
+                duty: self.channel1.duty,
+                duty_position: self.channel1.duty_position,
+                length_timer: self.channel1.length_timer,
+                length_enabled: self.channel1.length_enabled,
+                volume: self.channel1.volume,
+                envelope_direction: self.channel1.envelope_direction,
+                envelope_pace: self.channel1.envelope_pace,
+                envelope_timer: self.channel1.envelope_timer,
+                period: self.channel1.period,
+                period_timer: self.channel1.period_timer,
+                sweep_enabled: self.channel1.sweep_enabled,
+                sweep_pace: self.channel1.sweep_pace,
+                sweep_direction: self.channel1.sweep_direction,
+                sweep_step: self.channel1.sweep_step,
+                sweep_timer: self.channel1.sweep_timer,
+                sweep_shadow: self.channel1.sweep_shadow,
+                sweep_negate_used: self.channel1.sweep_negate_used,
+            },
+            channel2: PulseChannelSave {
+                enabled: self.channel2.enabled,
+                dac_enabled: self.channel2.dac_enabled,
+                duty: self.channel2.duty,
+                duty_position: self.channel2.duty_position,
+                length_timer: self.channel2.length_timer,
+                length_enabled: self.channel2.length_enabled,
+                volume: self.channel2.volume,
+                envelope_direction: self.channel2.envelope_direction,
+                envelope_pace: self.channel2.envelope_pace,
+                envelope_timer: self.channel2.envelope_timer,
+                period: self.channel2.period,
+                period_timer: self.channel2.period_timer,
+                sweep_enabled: false,
+                sweep_pace: 0,
+                sweep_direction: false,
+                sweep_step: 0,
+                sweep_timer: 0,
+                sweep_shadow: 0,
+                sweep_negate_used: false,
+            },
+            channel3: WaveChannelSave {
+                enabled: self.channel3.enabled,
+                dac_enabled: self.channel3.dac_enabled,
+                length_timer: self.channel3.length_timer,
+                length_enabled: self.channel3.length_enabled,
+                output_level: self.channel3.output_level,
+                period: self.channel3.period,
+                period_timer: self.channel3.period_timer,
+                sample_index: self.channel3.sample_index,
+                sample_buffer: self.channel3.sample_buffer,
+                just_accessed_ram: self.channel3.just_accessed_ram,
+                last_access_cycle: self.channel3.last_access_cycle,
+                last_access_sample_index: self.channel3.last_access_sample_index,
+            },
+            channel4: NoiseChannelSave {
+                enabled: self.channel4.enabled,
+                dac_enabled: self.channel4.dac_enabled,
+                length_timer: self.channel4.length_timer,
+                length_enabled: self.channel4.length_enabled,
+                volume: self.channel4.volume,
+                envelope_direction: self.channel4.envelope_direction,
+                envelope_pace: self.channel4.envelope_pace,
+                envelope_timer: self.channel4.envelope_timer,
+                clock_shift: self.channel4.clock_shift,
+                width_mode: self.channel4.width_mode,
+                divisor_code: self.channel4.divisor_code,
+                lfsr: self.channel4.lfsr,
+                period_timer: self.channel4.period_timer,
+            },
+            wave_ram: self.wave_ram.to_vec(),
+            frame_sequencer_step: self.frame_sequencer_step,
+            frame_sequencer_counter: self.frame_sequencer_counter,
+            sample_counter: self.sample_counter,
+            samples_emitted: self.samples_emitted,
+            cycles: self.cycles,
+            hardware_mode: self.hardware_mode,
+        }
+    }
+
+    fn apply_save_state(&mut self, state: ApuSaveState) {
+        self.master_enable = state.master_enable;
+        self.nr50 = state.nr50;
+        self.nr51 = state.nr51;
+        let len = state.registers.len().min(self.registers.len());
+        self.registers[..len].copy_from_slice(&state.registers[..len]);
+
+        self.channel1.enabled = state.channel1.enabled;
+        self.channel1.dac_enabled = state.channel1.dac_enabled;
+        self.channel1.duty = state.channel1.duty;
+        self.channel1.duty_position = state.channel1.duty_position;
+        self.channel1.length_timer = state.channel1.length_timer;
+        self.channel1.length_enabled = state.channel1.length_enabled;
+        self.channel1.volume = state.channel1.volume;
+        self.channel1.envelope_direction = state.channel1.envelope_direction;
+        self.channel1.envelope_pace = state.channel1.envelope_pace;
+        self.channel1.envelope_timer = state.channel1.envelope_timer;
+        self.channel1.period = state.channel1.period;
+        self.channel1.period_timer = state.channel1.period_timer;
+        self.channel1.sweep_enabled = state.channel1.sweep_enabled;
+        self.channel1.sweep_pace = state.channel1.sweep_pace;
+        self.channel1.sweep_direction = state.channel1.sweep_direction;
+        self.channel1.sweep_step = state.channel1.sweep_step;
+        self.channel1.sweep_timer = state.channel1.sweep_timer;
+        self.channel1.sweep_shadow = state.channel1.sweep_shadow;
+        self.channel1.sweep_negate_used = state.channel1.sweep_negate_used;
+
+        self.channel2.enabled = state.channel2.enabled;
+        self.channel2.dac_enabled = state.channel2.dac_enabled;
+        self.channel2.duty = state.channel2.duty;
+        self.channel2.duty_position = state.channel2.duty_position;
+        self.channel2.length_timer = state.channel2.length_timer;
+        self.channel2.length_enabled = state.channel2.length_enabled;
+        self.channel2.volume = state.channel2.volume;
+        self.channel2.envelope_direction = state.channel2.envelope_direction;
+        self.channel2.envelope_pace = state.channel2.envelope_pace;
+        self.channel2.envelope_timer = state.channel2.envelope_timer;
+        self.channel2.period = state.channel2.period;
+        self.channel2.period_timer = state.channel2.period_timer;
+
+        self.channel3.enabled = state.channel3.enabled;
+        self.channel3.dac_enabled = state.channel3.dac_enabled;
+        self.channel3.length_timer = state.channel3.length_timer;
+        self.channel3.length_enabled = state.channel3.length_enabled;
+        self.channel3.output_level = state.channel3.output_level;
+        self.channel3.period = state.channel3.period;
+        self.channel3.period_timer = state.channel3.period_timer;
+        self.channel3.sample_index = state.channel3.sample_index;
+        self.channel3.sample_buffer = state.channel3.sample_buffer;
+        self.channel3.just_accessed_ram = state.channel3.just_accessed_ram;
+        self.channel3.last_access_cycle = state.channel3.last_access_cycle;
+        self.channel3.last_access_sample_index = state.channel3.last_access_sample_index;
+
+        self.channel4.enabled = state.channel4.enabled;
+        self.channel4.dac_enabled = state.channel4.dac_enabled;
+        self.channel4.length_timer = state.channel4.length_timer;
+        self.channel4.length_enabled = state.channel4.length_enabled;
+        self.channel4.volume = state.channel4.volume;
+        self.channel4.envelope_direction = state.channel4.envelope_direction;
+        self.channel4.envelope_pace = state.channel4.envelope_pace;
+        self.channel4.envelope_timer = state.channel4.envelope_timer;
+        self.channel4.clock_shift = state.channel4.clock_shift;
+        self.channel4.width_mode = state.channel4.width_mode;
+        self.channel4.divisor_code = state.channel4.divisor_code;
+        self.channel4.lfsr = state.channel4.lfsr;
+        self.channel4.period_timer = state.channel4.period_timer;
+
+        let len = state.wave_ram.len().min(self.wave_ram.len());
+        self.wave_ram[..len].copy_from_slice(&state.wave_ram[..len]);
+        self.frame_sequencer_step = state.frame_sequencer_step;
+        self.frame_sequencer_counter = state.frame_sequencer_counter;
+        self.sample_counter = state.sample_counter;
+        self.samples_emitted = state.samples_emitted;
+        self.cycles = state.cycles;
+        self.hardware_mode = state.hardware_mode;
     }
 
     fn chase_clock(&mut self) {

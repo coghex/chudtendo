@@ -65,9 +65,13 @@ impl MasterClock {
     pub fn advance(&self, cycles: u64) {
         self.target_cycle.store(cycles, Ordering::Release);
     }
+
+    pub fn store(&self, cycles: u64) {
+        self.target_cycle.store(cycles, Ordering::Release);
+    }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum HardwareMode {
     Cgb,
     DmgCompatibility,
@@ -150,6 +154,8 @@ pub struct PublishedFrame {
 pub enum Command {
     Memory(MemoryCommand),
     SetHardwareMode(HardwareMode),
+    SaveState(std::sync::mpsc::Sender<Vec<u8>>),
+    LoadState(Vec<u8>),
     Stop,
 }
 

@@ -1,10 +1,19 @@
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::thread;
 
+use serde::{Deserialize, Serialize};
+
 use super::component::{
     Command, ComponentReport, HardwareMode, MemoryCommand, ReadResult, WramInitState, WramReport,
     WriteResult,
 };
+
+#[derive(Serialize, Deserialize)]
+pub struct WramSaveState {
+    pub banks: Vec<Vec<u8>>,
+    pub selected_bank: u8,
+    pub hardware_mode: HardwareMode,
+}
 
 const WRAM_REPORT_INTERVAL: u64 = 4096;
 
@@ -42,6 +51,16 @@ impl WramThread {
                     Ok(Command::Memory(command)) => self.handle_memory(command),
                     Ok(Command::SetHardwareMode(hardware_mode)) => {
                         self.hardware_mode = hardware_mode;
+                    }
+                    Ok(Command::SaveState(respond_to)) => {
+                        let state = self.create_save_state();
+                        let bytes = bincode::serialize(&state).unwrap_or_default();
+                        let _ = respond_to.send(bytes);
+                    }
+                    Ok(Command::LoadState(bytes)) => {
+                        if let Ok(state) = bincode::deserialize::<WramSaveState>(&bytes) {
+                            self.apply_save_state(state);
+                        }
                     }
                     Ok(Command::Stop) => {
                         running = false;
@@ -139,6 +158,20 @@ impl WramThread {
             steps: 0,
             last_reported_bank: selected_bank,
         }
+    }
+
+    fn create_save_state(&self) -> WramSaveState {
+        WramSaveState {
+            banks: self.banks.clone(),
+            selected_bank: self.selected_bank,
+            hardware_mode: self.hardware_mode,
+        }
+    }
+
+    fn apply_save_state(&mut self, state: WramSaveState) {
+        self.banks = state.banks;
+        self.selected_bank = state.selected_bank;
+        self.hardware_mode = state.hardware_mode;
     }
 }
 

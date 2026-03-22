@@ -81,6 +81,39 @@ impl Bus {
         }
     }
 
+    /// Send SaveState to each component and return one receiver per component.
+    /// Order: cpu, ppu, wram, cartridge, timer, apu.
+    pub fn save_state_components(
+        &self,
+    ) -> Vec<std::sync::mpsc::Receiver<Vec<u8>>> {
+        use std::sync::mpsc;
+        let mut receivers = Vec::with_capacity(6);
+        for sender in [
+            &self.cpu,
+            &self.ppu,
+            &self.wram,
+            &self.cartridge,
+            &self.timer,
+            &self.apu,
+        ] {
+            let (tx, rx) = mpsc::channel();
+            let _ = sender.send(Command::SaveState(tx));
+            receivers.push(rx);
+        }
+        receivers
+    }
+
+    /// Send LoadState bytes to each component in order: cpu, ppu, wram, cartridge, timer, apu.
+    pub fn load_state_components(&self, blobs: [Vec<u8>; 6]) {
+        let [cpu, ppu, wram, cartridge, timer, apu] = blobs;
+        let _ = self.cpu.send(Command::LoadState(cpu));
+        let _ = self.ppu.send(Command::LoadState(ppu));
+        let _ = self.wram.send(Command::LoadState(wram));
+        let _ = self.cartridge.send(Command::LoadState(cartridge));
+        let _ = self.timer.send(Command::LoadState(timer));
+        let _ = self.apu.send(Command::LoadState(apu));
+    }
+
     pub fn propagate_hardware_mode(&self, hardware_mode: HardwareMode) {
         for sender in [&self.ppu, &self.wram, &self.timer, &self.cartridge, &self.apu] {
             let _ = sender.send(Command::SetHardwareMode(hardware_mode));

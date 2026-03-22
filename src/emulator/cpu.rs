@@ -2,12 +2,40 @@ use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError};
 use std::thread;
 use std::time::Instant;
 
+use serde::{Deserialize, Serialize};
+
 use super::bus::Bus;
 use super::component::{
     Command, ComponentReport, CpuInitState, CpuRegisters, CpuReport, HardwareMode, InterruptFlags,
     MasterClock, MemoryCommand, ReadResult, SharedCartridgeReadState, WriteResult,
+    IO_REGISTERS_LEN, HRAM_LEN,
 };
 use crate::input::JoypadState;
+
+#[derive(Serialize, Deserialize)]
+pub struct CpuSaveState {
+    pub af: u16,
+    pub bc: u16,
+    pub de: u16,
+    pub hl: u16,
+    pub sp: u16,
+    pub pc: u16,
+    pub io_registers: Vec<u8>,
+    pub hram: Vec<u8>,
+    pub interrupt_enable: u8,
+    pub interrupt_master_enable: bool,
+    pub ime_enable_delay: u8,
+    pub double_speed: bool,
+    pub speed_switch_armed: bool,
+    pub serial_transfer_countdown: u16,
+    pub cycles: u64,
+    pub is_halted: bool,
+    pub is_stopped: bool,
+    pub halt_bug: bool,
+    pub steps: u64,
+    pub hardware_mode: HardwareMode,
+    pub boot_rom_unmapped: bool,
+}
 
 const FLAG_Z: u8 = 0x80;
 const FLAG_N: u8 = 0x40;
@@ -84,6 +112,7 @@ pub struct CpuThread {
     halt_bug: bool,
     steps: u64,
     shutdown: bool,
+    pacing_epoch: Option<Instant>,
 }
 
 impl CpuThread {
@@ -107,7 +136,7 @@ impl CpuThread {
         clock: MasterClock,
     ) {
         self.clock = clock.clone();
-        let start = Instant::now();
+        self.pacing_epoch = Some(Instant::now());
 
         while !self.shutdown {
             self.service_inbox(&inbox);
@@ -115,6 +144,7 @@ impl CpuThread {
                 break;
             }
 
+            let start = self.pacing_epoch.unwrap();
             let elapsed_nanos = start.elapsed().as_nanos() as u64;
             let wall_target = elapsed_nanos
                 .checked_mul(super::component::CPU_CLOCK_HZ)
@@ -590,6 +620,16 @@ impl CpuThread {
             match inbox.try_recv() {
                 Ok(Command::Memory(command)) => self.handle_memory(command),
                 Ok(Command::SetHardwareMode(hardware_mode)) => self.hardware_mode = hardware_mode,
+                Ok(Command::SaveState(respond_to)) => {
+                    let state = self.create_save_state();
+                    let bytes = bincode::serialize(&state).unwrap_or_default();
+                    let _ = respond_to.send(bytes);
+                }
+                Ok(Command::LoadState(bytes)) => {
+                    if let Ok(state) = bincode::deserialize::<CpuSaveState>(&bytes) {
+                        self.apply_save_state(state);
+                    }
+                }
                 Ok(Command::Stop) => {
                     self.shutdown = true;
                     break;
@@ -601,6 +641,74 @@ impl CpuThread {
                 }
             }
         }
+    }
+
+    fn create_save_state(&self) -> CpuSaveState {
+        CpuSaveState {
+            af: self.registers.af,
+            bc: self.registers.bc,
+            de: self.registers.de,
+            hl: self.registers.hl,
+            sp: self.registers.sp,
+            pc: self.registers.pc,
+            io_registers: self.io_registers.to_vec(),
+            hram: self.hram.to_vec(),
+            interrupt_enable: self.interrupt_enable,
+            interrupt_master_enable: self.interrupt_master_enable,
+            ime_enable_delay: self.ime_enable_delay,
+            double_speed: self.double_speed,
+            speed_switch_armed: self.speed_switch_armed,
+            serial_transfer_countdown: self.serial_transfer_countdown,
+            cycles: self.cycles,
+            is_halted: matches!(self.state, CoreState::Halted),
+            is_stopped: matches!(self.state, CoreState::Stopped),
+            halt_bug: self.halt_bug,
+            steps: self.steps,
+            hardware_mode: self.hardware_mode,
+            boot_rom_unmapped: self.boot_rom_unmapped,
+        }
+    }
+
+    fn apply_save_state(&mut self, state: CpuSaveState) {
+        self.registers.af = state.af;
+        self.registers.bc = state.bc;
+        self.registers.de = state.de;
+        self.registers.hl = state.hl;
+        self.registers.sp = state.sp;
+        self.registers.pc = state.pc;
+        let len = state.io_registers.len().min(IO_REGISTERS_LEN);
+        self.io_registers[..len].copy_from_slice(&state.io_registers[..len]);
+        let len = state.hram.len().min(HRAM_LEN);
+        self.hram[..len].copy_from_slice(&state.hram[..len]);
+        self.interrupt_enable = state.interrupt_enable;
+        self.interrupt_master_enable = state.interrupt_master_enable;
+        self.ime_enable_delay = state.ime_enable_delay;
+        self.double_speed = state.double_speed;
+        self.speed_switch_armed = state.speed_switch_armed;
+        self.serial_transfer_countdown = state.serial_transfer_countdown;
+        self.cycles = state.cycles;
+        self.state = if state.is_halted {
+            CoreState::Halted
+        } else if state.is_stopped {
+            CoreState::Stopped
+        } else {
+            CoreState::Running
+        };
+        self.halt_bug = state.halt_bug;
+        self.steps = state.steps;
+        self.hardware_mode = state.hardware_mode;
+        self.boot_rom_unmapped = state.boot_rom_unmapped;
+        // Update shared cartridge boot ROM mapping if available
+        if let Some(shared) = &self.shared_cartridge {
+            shared.set_boot_rom_mapped(!state.boot_rom_unmapped);
+        }
+        self.clock.store(state.cycles);
+        // Backdate the pacing epoch so wall_target matches self.cycles right now.
+        // This prevents both racing (epoch too old) and freezing (epoch too new).
+        let elapsed_nanos = self.cycles
+            .saturating_mul(1_000_000_000)
+            / super::component::CPU_CLOCK_HZ;
+        self.pacing_epoch = Some(Instant::now() - std::time::Duration::from_nanos(elapsed_nanos));
     }
 
     fn read_byte(&mut self, inbox: &Receiver<Command>, address: u16) -> u8 {
@@ -1178,6 +1286,7 @@ impl CpuThread {
             halt_bug: false,
             steps: 0,
             shutdown: false,
+            pacing_epoch: None,
         }
     }
 

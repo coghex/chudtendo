@@ -8,11 +8,59 @@ use std::time::Instant;
 
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
+use serde::{Deserialize, Serialize};
 
 use super::component::{
     CartridgeReport, Command, ComponentReport, MemoryCommand, ReadResult, SharedCartridgeReadState,
     WriteResult,
 };
+
+#[derive(Serialize, Deserialize)]
+pub struct CartridgeSaveState {
+    pub ram: Vec<u8>,
+    pub boot_rom_mapped: bool,
+    pub controller: CartridgeControllerSave,
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum CartridgeControllerSave {
+    RomOnly,
+    Mbc1 {
+        ram_enabled: bool,
+        rom_bank_low5: u8,
+        bank_high2: u8,
+        mode_is_ram_banking: bool,
+    },
+    Mbc2 {
+        ram_enabled: bool,
+        rom_bank: u8,
+        ram: Vec<u8>,
+    },
+    Mbc3 {
+        ram_enabled: bool,
+        rom_bank: u8,
+        bank_select: u8,
+        latch_prep: bool,
+        rtc_seconds: u8,
+        rtc_minutes: u8,
+        rtc_hours: u8,
+        rtc_day_low: u8,
+        rtc_day_high: u8,
+        rtc_latched_seconds: u8,
+        rtc_latched_minutes: u8,
+        rtc_latched_hours: u8,
+        rtc_latched_day_low: u8,
+        rtc_latched_day_high: u8,
+        /// Elapsed milliseconds since base_instant (for RTC reconstruction).
+        rtc_elapsed_ms: u64,
+    },
+    Mbc5 {
+        ram_enabled: bool,
+        rom_bank_low: u8,
+        rom_bank_high: u8,
+        ram_bank: u8,
+    },
+}
 
 const MIN_ROM_BYTES: usize = 0x150;
 const ROM_BANK_SIZE: usize = 0x4000;
@@ -536,6 +584,16 @@ impl CartridgeThread {
                 match inbox.try_recv() {
                     Ok(Command::Memory(command)) => self.handle_memory(command),
                     Ok(Command::SetHardwareMode(_)) => {}
+                    Ok(Command::SaveState(respond_to)) => {
+                        let state = self.create_save_state();
+                        let bytes = bincode::serialize(&state).unwrap_or_default();
+                        let _ = respond_to.send(bytes);
+                    }
+                    Ok(Command::LoadState(bytes)) => {
+                        if let Ok(state) = bincode::deserialize::<CartridgeSaveState>(&bytes) {
+                            self.apply_save_state(state);
+                        }
+                    }
                     Ok(Command::Stop) => {
                         running = false;
                         break;
@@ -638,6 +696,125 @@ impl CartridgeThread {
 
         shared_read_state.set_lower_rom_bank(self.controller.lower_rom_bank(&self.metadata));
         shared_read_state.set_selected_rom_bank(self.controller.selected_rom_bank(&self.metadata));
+    }
+
+    fn create_save_state(&self) -> CartridgeSaveState {
+        let controller = match &self.controller {
+            CartridgeController::RomOnly => CartridgeControllerSave::RomOnly,
+            CartridgeController::Mbc1(s) => CartridgeControllerSave::Mbc1 {
+                ram_enabled: s.ram_enabled,
+                rom_bank_low5: s.rom_bank_low5,
+                bank_high2: s.bank_high2,
+                mode_is_ram_banking: matches!(s.mode, Mbc1Mode::RamBanking),
+            },
+            CartridgeController::Mbc2(s) => CartridgeControllerSave::Mbc2 {
+                ram_enabled: s.ram_enabled,
+                rom_bank: s.rom_bank,
+                ram: s.ram.to_vec(),
+            },
+            CartridgeController::Mbc3(s) => {
+                // Advance the RTC before snapshotting so the elapsed duration is captured.
+                let elapsed_ms = s.rtc.base_instant.elapsed().as_millis() as u64;
+                CartridgeControllerSave::Mbc3 {
+                    ram_enabled: s.ram_enabled,
+                    rom_bank: s.rom_bank,
+                    bank_select: s.bank_select,
+                    latch_prep: s.latch_prep,
+                    rtc_seconds: s.rtc.seconds,
+                    rtc_minutes: s.rtc.minutes,
+                    rtc_hours: s.rtc.hours,
+                    rtc_day_low: s.rtc.day_low,
+                    rtc_day_high: s.rtc.day_high,
+                    rtc_latched_seconds: s.rtc.latched_seconds,
+                    rtc_latched_minutes: s.rtc.latched_minutes,
+                    rtc_latched_hours: s.rtc.latched_hours,
+                    rtc_latched_day_low: s.rtc.latched_day_low,
+                    rtc_latched_day_high: s.rtc.latched_day_high,
+                    rtc_elapsed_ms: elapsed_ms,
+                }
+            }
+            CartridgeController::Mbc5(s) => CartridgeControllerSave::Mbc5 {
+                ram_enabled: s.ram_enabled,
+                rom_bank_low: s.rom_bank_low,
+                rom_bank_high: s.rom_bank_high,
+                ram_bank: s.ram_bank,
+            },
+        };
+
+        CartridgeSaveState {
+            ram: self.ram.clone(),
+            boot_rom_mapped: self.boot_rom_mapped,
+            controller,
+        }
+    }
+
+    fn apply_save_state(&mut self, state: CartridgeSaveState) {
+        self.ram = state.ram;
+        self.boot_rom_mapped = state.boot_rom_mapped;
+        if let Some(shared) = &self.shared_read_state {
+            shared.set_boot_rom_mapped(state.boot_rom_mapped);
+        }
+
+        match (&mut self.controller, state.controller) {
+            (CartridgeController::RomOnly, CartridgeControllerSave::RomOnly) => {}
+            (CartridgeController::Mbc1(s), CartridgeControllerSave::Mbc1 {
+                ram_enabled, rom_bank_low5, bank_high2, mode_is_ram_banking,
+            }) => {
+                s.ram_enabled = ram_enabled;
+                s.rom_bank_low5 = rom_bank_low5;
+                s.bank_high2 = bank_high2;
+                s.mode = if mode_is_ram_banking { Mbc1Mode::RamBanking } else { Mbc1Mode::RomBanking };
+            }
+            (CartridgeController::Mbc2(s), CartridgeControllerSave::Mbc2 {
+                ram_enabled, rom_bank, ram,
+            }) => {
+                s.ram_enabled = ram_enabled;
+                s.rom_bank = rom_bank;
+                let len = ram.len().min(s.ram.len());
+                s.ram[..len].copy_from_slice(&ram[..len]);
+            }
+            (CartridgeController::Mbc3(s), CartridgeControllerSave::Mbc3 {
+                ram_enabled, rom_bank, bank_select, latch_prep,
+                rtc_seconds, rtc_minutes, rtc_hours, rtc_day_low, rtc_day_high,
+                rtc_latched_seconds, rtc_latched_minutes, rtc_latched_hours,
+                rtc_latched_day_low, rtc_latched_day_high, rtc_elapsed_ms,
+            }) => {
+                s.ram_enabled = ram_enabled;
+                s.rom_bank = rom_bank;
+                s.bank_select = bank_select;
+                s.latch_prep = latch_prep;
+                s.rtc.seconds = rtc_seconds;
+                s.rtc.minutes = rtc_minutes;
+                s.rtc.hours = rtc_hours;
+                s.rtc.day_low = rtc_day_low;
+                s.rtc.day_high = rtc_day_high;
+                s.rtc.latched_seconds = rtc_latched_seconds;
+                s.rtc.latched_minutes = rtc_latched_minutes;
+                s.rtc.latched_hours = rtc_latched_hours;
+                s.rtc.latched_day_low = rtc_latched_day_low;
+                s.rtc.latched_day_high = rtc_latched_day_high;
+                // Reconstruct base_instant so elapsed time since save-state is counted correctly.
+                // We set base_instant to (now - elapsed_ms) so the RTC continues from where
+                // it was when the state was saved.
+                let elapsed_dur = std::time::Duration::from_millis(rtc_elapsed_ms);
+                s.rtc.base_instant = Instant::now()
+                    .checked_sub(elapsed_dur)
+                    .unwrap_or_else(Instant::now);
+            }
+            (CartridgeController::Mbc5(s), CartridgeControllerSave::Mbc5 {
+                ram_enabled, rom_bank_low, rom_bank_high, ram_bank,
+            }) => {
+                s.ram_enabled = ram_enabled;
+                s.rom_bank_low = rom_bank_low;
+                s.rom_bank_high = rom_bank_high;
+                s.ram_bank = ram_bank;
+            }
+            _ => {
+                // MBC type mismatch — silently ignore to avoid corrupting state.
+            }
+        }
+
+        self.publish_shared_bank_state();
     }
 }
 
@@ -986,6 +1163,7 @@ impl Mbc3State {
                 WriteResult::Accepted
             }
             0x2000..=0x3fff => {
+                // Standard MBC3 uses a 7-bit bank register; bank 0 maps to 1.
                 self.rom_bank = match value & 0x7f {
                     0 => 1,
                     bank => bank,

@@ -2,12 +2,34 @@ use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, TrySendError};
 use std::thread;
 use std::time::Instant;
 
+use serde::{Deserialize, Serialize};
+
 use super::bus::{Bus, PendingRead};
 use super::component::{
     BYTES_PER_PIXEL, Command, ComponentReport, FRAMEBUFFER_SIZE, HardwareMode, InterruptFlags,
     MasterClock, MemoryCommand, PpuInitState, PpuReport, PublishedFrame, ReadResult, SCREEN_HEIGHT,
     SCREEN_WIDTH, WriteResult,
 };
+
+#[derive(Serialize, Deserialize)]
+pub struct PpuSaveState {
+    pub vram_banks: Vec<Vec<u8>>,
+    pub selected_vram_bank: u8,
+    pub oam: Vec<u8>,
+    pub lcd_registers: Vec<u8>,
+    pub hdma_registers: Vec<u8>,
+    pub bg_palette_index: u8,
+    pub obj_palette_index: u8,
+    pub bg_palette_ram: Vec<u8>,
+    pub obj_palette_ram: Vec<u8>,
+    pub dots_into_line: u16,
+    pub stat_interrupt_line: bool,
+    pub stat_interrupt_armed: bool,
+    pub window_line: u8,
+    pub dots: u64,
+    pub frames: u64,
+    pub hardware_mode: HardwareMode,
+}
 
 const VRAM_BANK_SIZE: usize = 0x2000;
 const VRAM_BANKS: usize = 2;
@@ -203,11 +225,74 @@ impl PpuThread {
                     self.report_framebuffer_pending = true;
                     self.report_dirty = true;
                 }
+                Ok(Command::SaveState(respond_to)) => {
+                    let state = self.create_save_state();
+                    let bytes = bincode::serialize(&state).unwrap_or_default();
+                    let _ = respond_to.send(bytes);
+                }
+                Ok(Command::LoadState(bytes)) => {
+                    if let Ok(state) = bincode::deserialize::<PpuSaveState>(&bytes) {
+                        self.apply_save_state(state);
+                    }
+                }
                 Ok(Command::Stop) => return false,
                 Err(TryRecvError::Empty) => return true,
                 Err(TryRecvError::Disconnected) => return false,
             }
         }
+    }
+
+    fn create_save_state(&self) -> PpuSaveState {
+        PpuSaveState {
+            vram_banks: self.vram_banks.clone(),
+            selected_vram_bank: self.selected_vram_bank,
+            oam: self.oam.to_vec(),
+            lcd_registers: self.lcd_registers.to_vec(),
+            hdma_registers: self.hdma_registers.to_vec(),
+            bg_palette_index: self.bg_palette_index,
+            obj_palette_index: self.obj_palette_index,
+            bg_palette_ram: self.bg_palette_ram.to_vec(),
+            obj_palette_ram: self.obj_palette_ram.to_vec(),
+            dots_into_line: self.dots_into_line,
+            stat_interrupt_line: self.stat_interrupt_line,
+            stat_interrupt_armed: self.stat_interrupt_armed,
+            window_line: self.window_line,
+            dots: self.dots,
+            frames: self.frames,
+            hardware_mode: self.hardware_mode,
+        }
+    }
+
+    fn apply_save_state(&mut self, state: PpuSaveState) {
+        self.vram_banks = state.vram_banks;
+        self.selected_vram_bank = state.selected_vram_bank;
+        let len = state.oam.len().min(OAM_SIZE);
+        self.oam[..len].copy_from_slice(&state.oam[..len]);
+        let len = state.lcd_registers.len().min(LCD_REGISTERS_LEN);
+        self.lcd_registers[..len].copy_from_slice(&state.lcd_registers[..len]);
+        let len = state.hdma_registers.len().min(HDMA_REGISTERS_LEN);
+        self.hdma_registers[..len].copy_from_slice(&state.hdma_registers[..len]);
+        self.bg_palette_index = state.bg_palette_index;
+        self.obj_palette_index = state.obj_palette_index;
+        let len = state.bg_palette_ram.len().min(PALETTE_RAM_LEN);
+        self.bg_palette_ram[..len].copy_from_slice(&state.bg_palette_ram[..len]);
+        let len = state.obj_palette_ram.len().min(PALETTE_RAM_LEN);
+        self.obj_palette_ram[..len].copy_from_slice(&state.obj_palette_ram[..len]);
+        self.dots_into_line = state.dots_into_line;
+        self.stat_interrupt_line = state.stat_interrupt_line;
+        self.stat_interrupt_armed = state.stat_interrupt_armed;
+        self.window_line = state.window_line;
+        self.dots = state.dots;
+        self.frames = state.frames;
+        self.hardware_mode = state.hardware_mode;
+        // Transient rendering data
+        self.oam_dma = None;
+        self.hdma = None;
+        // Rebuild rendering snapshots from the restored VRAM/OAM
+        self.snapshot_vram_for_rendering();
+        self.report_dirty = true;
+        self.framebuffer_dirty = true;
+        self.report_framebuffer_pending = true;
     }
 
     fn handle_memory(&mut self, command: MemoryCommand) {

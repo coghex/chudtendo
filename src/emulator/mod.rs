@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
+use serde::{Deserialize, Serialize};
 
 pub use bus::{PendingRead, PendingWrite};
 pub use cartridge::{
@@ -30,6 +31,18 @@ use component::{
     Command, ComponentReport, CpuInitState, InterruptFlags, MasterClock, PpuInitState,
     SharedCartridgeReadState, TimerInitState, WramInitState,
 };
+
+/// The full on-disk save state bundle.
+#[derive(Serialize, Deserialize)]
+struct FullSaveState {
+    cpu: Vec<u8>,
+    ppu: Vec<u8>,
+    wram: Vec<u8>,
+    cartridge: Vec<u8>,
+    timer: Vec<u8>,
+    apu: Vec<u8>,
+    clock_cycles: u64,
+}
 
 #[derive(Debug)]
 struct WorkerHandle {
@@ -523,6 +536,93 @@ impl Emulator {
 
         self.frame_ready = None;
         self.frame_recycle = None;
+    }
+
+    fn state_path(&self, slot: u8) -> Option<PathBuf> {
+        self.config
+            .save_path
+            .as_ref()
+            .map(|p| p.with_extension(format!("state{slot}")))
+    }
+
+    pub fn save_state(&self, slot: u8) -> Result<(), String> {
+        let path = self
+            .state_path(slot)
+            .ok_or_else(|| "no ROM path configured; cannot determine save state path".to_owned())?;
+
+        // Send SaveState command to all 6 components and collect receivers.
+        let receivers = self.bus.save_state_components();
+
+        // Wait for all 6 responses with a timeout.
+        let timeout = Duration::from_secs(2);
+        let deadline = Instant::now() + timeout;
+        let mut blobs: Vec<Option<Vec<u8>>> = vec![None; 6];
+
+        while blobs.iter().any(|b| b.is_none()) {
+            if Instant::now() > deadline {
+                return Err("timeout waiting for component save state".to_owned());
+            }
+            for (i, rx) in receivers.iter().enumerate() {
+                if blobs[i].is_none() {
+                    if let Ok(bytes) = rx.try_recv() {
+                        blobs[i] = Some(bytes);
+                    }
+                }
+            }
+            thread::yield_now();
+        }
+
+        let mut blobs = blobs.into_iter().map(|b| b.unwrap());
+        let clock_cycles = self
+            .clock
+            .as_ref()
+            .map(|c| c.target())
+            .unwrap_or(0);
+
+        let full = FullSaveState {
+            cpu: blobs.next().unwrap(),
+            ppu: blobs.next().unwrap(),
+            wram: blobs.next().unwrap(),
+            cartridge: blobs.next().unwrap(),
+            timer: blobs.next().unwrap(),
+            apu: blobs.next().unwrap(),
+            clock_cycles,
+        };
+
+        let bytes =
+            bincode::serialize(&full).map_err(|e| format!("failed to serialize save state: {e}"))?;
+        std::fs::write(&path, &bytes)
+            .map_err(|e| format!("failed to write save state to {}: {e}", path.display()))?;
+
+        Ok(())
+    }
+
+    pub fn load_state(&self, slot: u8) -> Result<(), String> {
+        let path = self
+            .state_path(slot)
+            .ok_or_else(|| "no ROM path configured; cannot determine save state path".to_owned())?;
+
+        let bytes = std::fs::read(&path)
+            .map_err(|e| format!("failed to read save state from {}: {e}", path.display()))?;
+        let full: FullSaveState = bincode::deserialize(&bytes)
+            .map_err(|e| format!("failed to deserialize save state: {e}"))?;
+
+        // Restore master clock before sending LoadState so components can
+        // use it when they resume.
+        if let Some(clock) = &self.clock {
+            clock.store(full.clock_cycles);
+        }
+
+        self.bus.load_state_components([
+            full.cpu,
+            full.ppu,
+            full.wram,
+            full.cartridge,
+            full.timer,
+            full.apu,
+        ]);
+
+        Ok(())
     }
 }
 
