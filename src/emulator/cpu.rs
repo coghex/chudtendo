@@ -117,6 +117,7 @@ pub struct CpuThread {
     pacing_epoch: Option<Instant>,
     /// Speed multiplier as fixed-point: 100 = 1.0x, 200 = 2.0x, 0 = uncapped.
     speed: Arc<AtomicU32>,
+    paused: Arc<std::sync::atomic::AtomicBool>,
     ppu_progress: super::component::PpuProgress,
 }
 
@@ -147,6 +148,19 @@ impl CpuThread {
             self.service_inbox(&inbox);
             if self.shutdown {
                 break;
+            }
+
+            if self.paused.load(Ordering::Relaxed) {
+                self.service_inbox(&inbox);
+                thread::yield_now();
+                // Backdate epoch on resume so wall_target matches current cycles.
+                let speed = self.speed.load(Ordering::Relaxed).max(1) as u128;
+                let elapsed_nanos = (self.cycles as u128 * 100_000_000_000)
+                    / (super::component::CPU_CLOCK_HZ as u128 * speed);
+                self.pacing_epoch = Some(
+                    Instant::now() - std::time::Duration::from_nanos(elapsed_nanos as u64),
+                );
+                continue;
             }
 
             let speed = self.speed.load(Ordering::Relaxed);
@@ -1323,6 +1337,7 @@ impl CpuThread {
             shutdown: false,
             pacing_epoch: None,
             speed: init_state.speed,
+            paused: init_state.paused,
             ppu_progress: init_state.ppu_progress,
         }
     }

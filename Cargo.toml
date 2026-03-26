@@ -12,6 +12,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 bincode = "1"
+rfd = "0.15"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa = "0.26"
+objc = "0.2"
 
 [dev-dependencies]
 png = "0.17"

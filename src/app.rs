@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use sdl2::audio::{AudioCallback, AudioSpecDesired};
@@ -10,6 +10,7 @@ use sdl2::video::Window;
 
 use crate::emulator::{CartridgeMetadata, Emulator, SCREEN_HEIGHT, SCREEN_WIDTH, Snapshot};
 use crate::input::Keybindings;
+use crate::menu::{self, MenuAction};
 use crate::shader::Shader;
 
 const WINDOW_SCALE: u32 = 4;
@@ -110,7 +111,7 @@ fn run_inner(
     if let Some(ppu_delay) = interactive_ppu_delay {
         emulator.set_ppu_delay(ppu_delay)?;
     }
-    let cartridge = emulator.cartridge_metadata().clone();
+    let mut cartridge = emulator.cartridge_metadata().clone();
 
     if matches!(run_mode, RunMode::SmokeTest) {
         emulator.start()?;
@@ -119,10 +120,13 @@ fn run_inner(
         return Ok(());
     }
 
+    // Install native menu bar (macOS: File, Emulation menus).
+    let menu_receiver = menu::install_menu_bar();
+
     // SDL video should stay on the main thread on macOS, so the emulator modules run in workers.
     emulator.start()?;
 
-    let _audio_device = if matches!(run_mode, RunMode::Interactive) {
+    let mut _audio_device = if matches!(run_mode, RunMode::Interactive) {
         init_audio(&sdl, &mut emulator)?
     } else {
         None
@@ -139,7 +143,7 @@ fn run_inner(
 
     let shader = load_shader();
     let keybindings = Keybindings::load_or_default(Path::new("keybindings.yaml"));
-    let joypad = emulator.joypad().clone();
+    let mut joypad = emulator.joypad().clone();
     let initial_snapshot = wait_for_live_snapshot(&mut emulator, Duration::from_millis(100));
     upload_framebuffer(&mut texture, &initial_snapshot.framebuffer, &shader)?;
     draw_frame(&mut canvas, &texture)?;
@@ -155,6 +159,49 @@ fn run_inner(
     let mut last_present_time = Instant::now();
 
     'running: loop {
+        // Poll menu actions.
+        while let Ok(action) = menu_receiver.try_recv() {
+            match action {
+                MenuAction::Quit => break 'running,
+                MenuAction::Pause => {
+                    let now_paused = emulator.toggle_pause();
+                    eprintln!("{}", if now_paused { "Paused" } else { "Resumed" });
+                }
+                MenuAction::Reset => {
+                    match emulator.reset() {
+                        Ok(()) => {
+                            _audio_device = init_audio(&sdl, &mut emulator)?;
+                            joypad = emulator.joypad().clone();
+                            eprintln!("Reset");
+                        }
+                        Err(e) => eprintln!("Reset failed: {e}"),
+                    }
+                }
+                MenuAction::LoadRom => {
+                    if let Some(path) = pick_rom_file() {
+                        match load_new_rom(
+                            &mut emulator,
+                            &path,
+                            dmg_mode,
+                            speed,
+                            interactive_ppu_delay,
+                        ) {
+                            Ok(()) => {
+                                _audio_device = init_audio(&sdl, &mut emulator)?;
+                                joypad = emulator.joypad().clone();
+                                cartridge = emulator.cartridge_metadata().clone();
+                                last_uploaded_frame = 0;
+                                last_presented_frame = 0;
+                                last_snapshot_frame = 0;
+                                eprintln!("Loaded: {}", cartridge.title);
+                            }
+                            Err(e) => eprintln!("Load ROM failed: {e}"),
+                        }
+                    }
+                }
+            }
+        }
+
         for event in event_pump.poll_iter() {
             match event {
                 Event::Quit { .. } => break 'running,
@@ -193,6 +240,18 @@ fn run_inner(
                                 Ok(()) => eprintln!("Saved state {slot}"),
                                 Err(e) => eprintln!("Save failed: {e}"),
                             }
+                        }
+                    } else if keycode == Keycode::F9 {
+                        let now_paused = emulator.toggle_pause();
+                        eprintln!("{}", if now_paused { "Paused" } else { "Resumed" });
+                    } else if keycode == Keycode::F10 {
+                        match emulator.reset() {
+                            Ok(()) => {
+                                _audio_device = init_audio(&sdl, &mut emulator)?;
+                                joypad = emulator.joypad().clone();
+                                eprintln!("Reset");
+                            }
+                            Err(e) => eprintln!("Reset failed: {e}"),
                         }
                     } else if let Some(button) = keybindings.lookup(&sdl_key_name(keycode)) {
                         joypad.press(button);
@@ -257,7 +316,7 @@ fn run_inner(
                 status_started.elapsed(),
             );
             let title_started = Instant::now();
-            update_title(&mut canvas, &cartridge, &snapshot)?;
+            update_title(&mut canvas, &cartridge, &snapshot, emulator.is_paused())?;
             trace_app_stage("update-title", snapshot.ppu_frames, title_started.elapsed());
             last_title_update = Instant::now();
         }
@@ -265,6 +324,37 @@ fn run_inner(
 
     emulator.stop();
 
+    Ok(())
+}
+
+fn pick_rom_file() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Load ROM")
+        .add_filter("Game Boy ROMs", &["gb", "gbc", "bin", "rom"])
+        .add_filter("All files", &["*"])
+        .pick_file()
+}
+
+fn load_new_rom(
+    emulator: &mut Emulator,
+    path: &Path,
+    dmg_mode: bool,
+    speed: f32,
+    ppu_delay: Option<Duration>,
+) -> Result<(), String> {
+    emulator.stop();
+    let mut new_emu = Emulator::from_rom_file(path).map_err(|e| e.to_string())?;
+    if dmg_mode {
+        new_emu.set_dmg_mode();
+    }
+    if speed != 1.0 {
+        new_emu.set_speed(speed);
+    }
+    if let Some(delay) = ppu_delay {
+        new_emu.set_ppu_delay(delay)?;
+    }
+    new_emu.start()?;
+    *emulator = new_emu;
     Ok(())
 }
 
@@ -415,15 +505,18 @@ fn update_title(
     canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
     cartridge: &CartridgeMetadata,
     snapshot: &Snapshot,
+    paused: bool,
 ) -> Result<(), String> {
+    let pause_indicator = if paused { " [PAUSED]" } else { "" };
     let title = format!(
-        "Chudtendo | {} | {} | {} | cpu={} ppu={} timer={}",
+        "Chudtendo | {} | {} | {} | cpu={} ppu={} timer={}{}",
         cartridge.title,
         cartridge.mbc.name(),
         cartridge.boot_mode.name(),
         snapshot.cpu_steps,
         snapshot.ppu_frames,
-        snapshot.timer_ticks
+        snapshot.timer_ticks,
+        pause_indicator,
     );
 
     canvas

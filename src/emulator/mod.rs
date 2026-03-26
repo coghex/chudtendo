@@ -120,6 +120,7 @@ pub struct Emulator {
     cached_snapshot: Snapshot,
     workers: Vec<WorkerHandle>,
     speed: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ppu_progress: Option<component::PpuProgress>,
 }
 
@@ -169,6 +170,7 @@ impl Emulator {
             cached_snapshot: Snapshot::default(),
             workers: Vec::new(),
             speed: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(100)),
+            paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ppu_progress: None,
         }
     }
@@ -248,6 +250,7 @@ impl Emulator {
         cpu_init.serial_output = self.serial_output_sender.take();
         cpu_init.interrupt_flags = interrupt_flags.clone();
         cpu_init.speed = self.speed.clone();
+        cpu_init.paused = self.paused.clone();
         if is_dmg_boot {
             cpu_init.hardware_mode = HardwareMode::DmgCompatibility;
             cpu_init.boot_target_mode = HardwareMode::DmgCompatibility;
@@ -662,6 +665,34 @@ impl Emulator {
     pub fn set_speed(&self, multiplier: f32) {
         let fixed = if multiplier <= 0.0 { 0 } else { (multiplier * 100.0) as u32 };
         self.speed.store(fixed, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn pause(&self) {
+        self.paused.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn resume(&self) {
+        self.paused.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn toggle_pause(&self) -> bool {
+        let was_paused = self.paused.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
+        !was_paused // returns new paused state
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn reset(&mut self) -> Result<(), String> {
+        self.stop();
+        // Re-create from the same config, preserving the cartridge image.
+        *self = Self::with_config(self.config.clone());
+        self.start()
+    }
+
+    pub fn config(&self) -> &EmulatorConfig {
+        &self.config
     }
 
     /// Mute audio by dropping the sample receiver. The APU's `try_send`

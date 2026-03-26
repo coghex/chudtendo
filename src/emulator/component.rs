@@ -350,6 +350,7 @@ pub struct CpuInitState {
     pub interrupt_flags: InterruptFlags,
     /// Speed multiplier: 100 = 1.0x, 200 = 2.0x, 0 = uncapped.
     pub speed: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    pub paused: std::sync::Arc<AtomicBool>,
     pub ppu_progress: PpuProgress,
 }
 
@@ -367,6 +368,7 @@ impl Default for CpuInitState {
             serial_output: None,
             interrupt_flags: InterruptFlags::new(),
             speed: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(100)),
+            paused: std::sync::Arc::new(AtomicBool::new(false)),
             ppu_progress: PpuProgress::new(),
         }
     }
