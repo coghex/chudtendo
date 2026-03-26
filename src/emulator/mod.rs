@@ -33,7 +33,7 @@ use component::{
 };
 
 /// The full on-disk save state bundle.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct FullSaveState {
     cpu: Vec<u8>,
     ppu: Vec<u8>,
@@ -42,6 +42,59 @@ struct FullSaveState {
     timer: Vec<u8>,
     apu: Vec<u8>,
     clock_cycles: u64,
+}
+
+/// A rewind snapshot bundles the component state with a copy of the
+/// framebuffer so we can display it immediately during rewind playback
+/// without waiting for the PPU to re-render.
+#[derive(Clone)]
+struct RewindSnapshot {
+    state: FullSaveState,
+    framebuffer: Vec<u8>,
+}
+
+const REWIND_BUFFER_DEFAULT_CAPACITY: usize = 450; // ~30 seconds at 1 capture per 4 frames
+
+struct RewindBuffer {
+    buffer: std::collections::VecDeque<RewindSnapshot>,
+    capacity: usize,
+}
+
+impl RewindBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            buffer: std::collections::VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn push(&mut self, snapshot: RewindSnapshot) {
+        if self.buffer.len() >= self.capacity {
+            self.buffer.pop_front();
+        }
+        self.buffer.push_back(snapshot);
+    }
+
+    fn pop(&mut self) -> Option<RewindSnapshot> {
+        self.buffer.pop_back()
+    }
+
+    fn clear(&mut self) {
+        self.buffer.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.buffer.len()
+    }
+}
+
+impl std::fmt::Debug for RewindBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RewindBuffer")
+            .field("len", &self.buffer.len())
+            .field("capacity", &self.capacity)
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -122,6 +175,7 @@ pub struct Emulator {
     speed: std::sync::Arc<std::sync::atomic::AtomicU32>,
     paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ppu_progress: Option<component::PpuProgress>,
+    rewind_buffer: RewindBuffer,
 }
 
 impl Emulator {
@@ -172,6 +226,7 @@ impl Emulator {
             speed: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(100)),
             paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ppu_progress: None,
+            rewind_buffer: RewindBuffer::new(REWIND_BUFFER_DEFAULT_CAPACITY),
         }
     }
 
@@ -556,15 +611,16 @@ impl Emulator {
             .map(|p| p.with_extension(format!("state{slot}")))
     }
 
-    pub fn save_state(&self, slot: u8) -> Result<(), String> {
-        let path = self
-            .state_path(slot)
-            .ok_or_else(|| "no ROM path configured; cannot determine save state path".to_owned())?;
+    /// Returns the modification timestamp for a save-state slot, or `None` if
+    /// the slot is empty / the path is not configured.
+    pub fn slot_timestamp(&self, slot: u8) -> Option<std::time::SystemTime> {
+        let path = self.state_path(slot)?;
+        std::fs::metadata(&path).ok()?.modified().ok()
+    }
 
-        // Send SaveState command to all 6 components and collect receivers.
+    fn capture_state(&self) -> Result<FullSaveState, String> {
         let receivers = self.bus.save_state_components();
 
-        // Wait for all 6 responses with a timeout.
         let timeout = Duration::from_secs(2);
         let deadline = Instant::now() + timeout;
         let mut blobs: Vec<Option<Vec<u8>>> = vec![None; 6];
@@ -590,7 +646,7 @@ impl Emulator {
             .map(|c| c.target())
             .unwrap_or(0);
 
-        let full = FullSaveState {
+        Ok(FullSaveState {
             cpu: blobs.next().unwrap(),
             ppu: blobs.next().unwrap(),
             wram: blobs.next().unwrap(),
@@ -598,7 +654,32 @@ impl Emulator {
             timer: blobs.next().unwrap(),
             apu: blobs.next().unwrap(),
             clock_cycles,
-        };
+        })
+    }
+
+    fn restore_state(&self, full: &FullSaveState) {
+        if let Some(clock) = &self.clock {
+            clock.store(full.clock_cycles);
+        }
+        if let Some(ref progress) = self.ppu_progress {
+            progress.set(full.clock_cycles);
+        }
+        self.bus.load_state_components([
+            full.cpu.clone(),
+            full.ppu.clone(),
+            full.wram.clone(),
+            full.cartridge.clone(),
+            full.timer.clone(),
+            full.apu.clone(),
+        ]);
+    }
+
+    pub fn save_state(&self, slot: u8) -> Result<(), String> {
+        let path = self
+            .state_path(slot)
+            .ok_or_else(|| "no ROM path configured; cannot determine save state path".to_owned())?;
+
+        let full = self.capture_state()?;
 
         let bytes =
             bincode::serialize(&full).map_err(|e| format!("failed to serialize save state: {e}"))?;
@@ -618,29 +699,61 @@ impl Emulator {
         let full: FullSaveState = bincode::deserialize(&bytes)
             .map_err(|e| format!("failed to deserialize save state: {e}"))?;
 
-        // Restore master clock before sending LoadState so components can
-        // use it when they resume.
-        if let Some(clock) = &self.clock {
-            clock.store(full.clock_cycles);
-        }
-
-        // Reset PPU progress to match the loaded clock so the CPU doesn't
-        // block waiting for the PPU to catch up from an old position.
-        // The PPU will update this to its actual position on its next advance.
-        if let Some(ref progress) = self.ppu_progress {
-            progress.set(full.clock_cycles);
-        }
-
-        self.bus.load_state_components([
-            full.cpu,
-            full.ppu,
-            full.wram,
-            full.cartridge,
-            full.timer,
-            full.apu,
-        ]);
+        self.restore_state(&full);
 
         Ok(())
+    }
+
+    /// Capture a snapshot into the rewind buffer.
+    ///
+    /// Pauses the CPU so the clock stops advancing, waits for all
+    /// components to settle, then captures a consistent snapshot.
+    /// Capture a snapshot into the rewind buffer.
+    ///
+    /// Pauses the CPU so the clock stops advancing, waits for all
+    /// components to settle, then captures a consistent snapshot
+    /// along with the current framebuffer for instant display during
+    /// rewind playback.
+    pub fn rewind_capture(&mut self, framebuffer: &[u8]) -> Result<(), String> {
+        // Pause the CPU so the master clock stops advancing.  Other
+        // clock-driven components (PPU, timer, APU) will finish their
+        // current work up to the frozen clock target and then idle.
+        self.pause();
+
+        // Wait for the CPU to finish its current instruction quantum and
+        // enter the pause loop, and for other components to drain to the
+        // frozen clock target.  1ms is enough for a 4-instruction quantum
+        // (~16 T-cycles) at 4 MHz, with margin.
+        thread::sleep(Duration::from_millis(1));
+
+        let result = self.capture_state();
+
+        self.resume();
+
+        let state = result?;
+        self.rewind_buffer.push(RewindSnapshot {
+            state,
+            framebuffer: framebuffer.to_vec(),
+        });
+        Ok(())
+    }
+
+    /// Step one snapshot backwards in the rewind buffer and restore it.
+    /// Returns the framebuffer to display, or `None` if the buffer is empty.
+    pub fn rewind_step(&mut self) -> Option<Vec<u8>> {
+        let snapshot = self.rewind_buffer.pop()?;
+        self.restore_state(&snapshot.state);
+        Some(snapshot.framebuffer)
+    }
+
+    /// Discard all rewind history (e.g. after reset or ROM load).
+    pub fn rewind_clear(&mut self) {
+        self.rewind_buffer.clear();
+    }
+
+    /// Number of rewind snapshots currently buffered.
+    pub fn rewind_len(&self) -> usize {
+        self.rewind_buffer.len()
     }
 
     // --- Headless agent API ---

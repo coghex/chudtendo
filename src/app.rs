@@ -121,7 +121,28 @@ fn run_inner(
     }
 
     // Install native menu bar (macOS: File, Emulation menus).
-    let menu_receiver = menu::install_menu_bar();
+    // Share the save path so the menu callback can query slot timestamps
+    // from the filesystem when the submenu opens.
+    let save_path = std::sync::Arc::new(std::sync::Mutex::new(
+        emulator.config().save_path.clone(),
+    ));
+    let menu_save_path = save_path.clone();
+    let slot_info_fn: menu::SlotInfoFn = Box::new(move || {
+        let path = menu_save_path.lock().unwrap().clone();
+        (1..=8u8)
+            .map(|slot| {
+                let ts = path.as_ref().and_then(|p| {
+                    let state_path = p.with_extension(format!("state{slot}"));
+                    let meta = std::fs::metadata(&state_path).ok()?;
+                    let modified = meta.modified().ok()?;
+                    let elapsed = modified.elapsed().ok()?;
+                    Some(format_elapsed(elapsed))
+                });
+                menu::SlotInfo { slot, timestamp: ts }
+            })
+            .collect()
+    });
+    let menu_receiver = menu::install_menu_bar(slot_info_fn);
 
     // SDL video should stay on the main thread on macOS, so the emulator modules run in workers.
     emulator.start()?;
@@ -151,6 +172,16 @@ fn run_inner(
     let mut event_pump = sdl
         .event_pump()
         .map_err(|error| format!("failed to create SDL event pump: {error}"))?;
+    let mut fast_forward_toggled = false;
+    let mut fast_forward_held = false;
+    let ff_speed: f32 = 0.0; // uncapped
+
+    let mut rewinding = false;
+    let mut last_rewind_step = Instant::now();
+    let mut last_rewind_capture_frame: u64 = 0;
+    const REWIND_CAPTURE_INTERVAL: u64 = 4; // capture every 4 frames
+    const REWIND_STEP_INTERVAL: Duration = Duration::from_millis(50); // ~20 steps/sec during rewind
+
     let mut last_title_update = Instant::now();
     let mut last_uploaded_frame = initial_snapshot.ppu_frames;
     let mut last_presented_frame = initial_snapshot.ppu_frames;
@@ -172,6 +203,8 @@ fn run_inner(
                         Ok(()) => {
                             _audio_device = init_audio(&sdl, &mut emulator)?;
                             joypad = emulator.joypad().clone();
+                            emulator.rewind_clear();
+                            last_rewind_capture_frame = 0;
                             eprintln!("Reset");
                         }
                         Err(e) => eprintln!("Reset failed: {e}"),
@@ -190,6 +223,9 @@ fn run_inner(
                                 _audio_device = init_audio(&sdl, &mut emulator)?;
                                 joypad = emulator.joypad().clone();
                                 cartridge = emulator.cartridge_metadata().clone();
+                                *save_path.lock().unwrap() = emulator.config().save_path.clone();
+                                emulator.rewind_clear();
+                                last_rewind_capture_frame = 0;
                                 last_uploaded_frame = 0;
                                 last_presented_frame = 0;
                                 last_snapshot_frame = 0;
@@ -197,6 +233,34 @@ fn run_inner(
                             }
                             Err(e) => eprintln!("Load ROM failed: {e}"),
                         }
+                    }
+                }
+                MenuAction::SaveState(slot) => {
+                    match emulator.save_state(slot) {
+                        Ok(()) => eprintln!("Saved state {slot}"),
+                        Err(e) => eprintln!("Save failed: {e}"),
+                    }
+                }
+                MenuAction::LoadState(slot) => {
+                    match emulator.load_state(slot) {
+                        Ok(()) => eprintln!("Loaded state {slot}"),
+                        Err(e) => eprintln!("Load failed: {e}"),
+                    }
+                }
+                MenuAction::ToggleFastForward => {
+                    fast_forward_toggled = !fast_forward_toggled;
+                    apply_ff_speed(&emulator, fast_forward_toggled || fast_forward_held, speed, ff_speed);
+                    eprintln!("Fast forward {}", if fast_forward_toggled { "ON" } else { "OFF" });
+                }
+                MenuAction::ToggleRewind => {
+                    rewinding = !rewinding;
+                    if rewinding {
+                        emulator.pause();
+                        last_rewind_step = Instant::now();
+                        eprintln!("Rewinding ({} snapshots)", emulator.rewind_len());
+                    } else {
+                        emulator.resume();
+                        eprintln!("Rewind stopped");
                     }
                 }
             }
@@ -249,10 +313,25 @@ fn run_inner(
                             Ok(()) => {
                                 _audio_device = init_audio(&sdl, &mut emulator)?;
                                 joypad = emulator.joypad().clone();
+                                emulator.rewind_clear();
+                                last_rewind_capture_frame = 0;
                                 eprintln!("Reset");
                             }
                             Err(e) => eprintln!("Reset failed: {e}"),
                         }
+                    } else if keycode == Keycode::F11 {
+                        fast_forward_toggled = !fast_forward_toggled;
+                        apply_ff_speed(&emulator, fast_forward_toggled || fast_forward_held, speed, ff_speed);
+                        eprintln!("Fast forward {}", if fast_forward_toggled { "ON" } else { "OFF" });
+                    } else if keycode == Keycode::Backquote {
+                        if !rewinding {
+                            rewinding = true;
+                            emulator.pause();
+                            last_rewind_step = Instant::now();
+                        }
+                    } else if keycode == Keycode::Tab {
+                        fast_forward_held = true;
+                        apply_ff_speed(&emulator, fast_forward_toggled || fast_forward_held, speed, ff_speed);
                     } else if let Some(button) = keybindings.lookup(&sdl_key_name(keycode)) {
                         joypad.press(button);
                     }
@@ -261,12 +340,34 @@ fn run_inner(
                     keycode: Some(keycode),
                     ..
                 } => {
-                    if let Some(button) = keybindings.lookup(&sdl_key_name(keycode)) {
+                    if keycode == Keycode::Backquote {
+                        if rewinding {
+                            rewinding = false;
+                            emulator.resume();
+                        }
+                    } else if keycode == Keycode::Tab {
+                        fast_forward_held = false;
+                        apply_ff_speed(&emulator, fast_forward_toggled || fast_forward_held, speed, ff_speed);
+                    } else if let Some(button) = keybindings.lookup(&sdl_key_name(keycode)) {
                         joypad.release(button);
                     }
                 }
                 _ => {}
             }
+        }
+
+        // --- Rewind step: restore snapshots backwards at fixed rate ---
+        if rewinding && last_rewind_step.elapsed() >= REWIND_STEP_INTERVAL {
+            if let Some(framebuffer) = emulator.rewind_step() {
+                // Display the framebuffer that was saved with this snapshot.
+                upload_framebuffer(&mut texture, &framebuffer, &shader)?;
+                draw_frame(&mut canvas, &texture)?;
+            } else {
+                eprintln!("Rewind buffer empty");
+                rewinding = false;
+                emulator.resume();
+            }
+            last_rewind_step = Instant::now();
         }
 
         if uses_vsync {
@@ -293,6 +394,17 @@ fn run_inner(
             upload_framebuffer(&mut texture, &frame.framebuffer, &shader)?;
             trace_app_stage("upload", frame.frame, upload_started.elapsed());
             last_uploaded_frame = frame.frame;
+
+            // --- Auto-capture for rewind buffer (every N frames, not while rewinding) ---
+            if !rewinding
+                && frame.frame >= last_rewind_capture_frame + REWIND_CAPTURE_INTERVAL
+            {
+                if let Err(e) = emulator.rewind_capture(&frame.framebuffer) {
+                    tracing::warn!("rewind capture failed: {e}");
+                }
+                last_rewind_capture_frame = frame.frame;
+            }
+
             emulator.recycle_framebuffer(frame.framebuffer);
         }
 
@@ -316,7 +428,12 @@ fn run_inner(
                 status_started.elapsed(),
             );
             let title_started = Instant::now();
-            update_title(&mut canvas, &cartridge, &snapshot, emulator.is_paused())?;
+            let rewind_info = if rewinding {
+                Some(emulator.rewind_len())
+            } else {
+                None
+            };
+            update_title(&mut canvas, &cartridge, &snapshot, emulator.is_paused(), rewind_info)?;
             trace_app_stage("update-title", snapshot.ppu_frames, title_started.elapsed());
             last_title_update = Instant::now();
         }
@@ -325,6 +442,30 @@ fn run_inner(
     emulator.stop();
 
     Ok(())
+}
+
+fn format_elapsed(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        "just now".to_owned()
+    } else if secs < 3600 {
+        let mins = secs / 60;
+        format!("{}m ago", mins)
+    } else if secs < 86400 {
+        let hours = secs / 3600;
+        format!("{}h ago", hours)
+    } else {
+        let days = secs / 86400;
+        format!("{}d ago", days)
+    }
+}
+
+fn apply_ff_speed(emulator: &Emulator, active: bool, normal_speed: f32, ff_speed: f32) {
+    if active {
+        emulator.set_speed(ff_speed);
+    } else {
+        emulator.set_speed(normal_speed);
+    }
 }
 
 fn pick_rom_file() -> Option<PathBuf> {
@@ -506,8 +647,15 @@ fn update_title(
     cartridge: &CartridgeMetadata,
     snapshot: &Snapshot,
     paused: bool,
+    rewind_info: Option<usize>,
 ) -> Result<(), String> {
-    let pause_indicator = if paused { " [PAUSED]" } else { "" };
+    let status = if let Some(remaining) = rewind_info {
+        format!(" [REWIND: {}]", remaining)
+    } else if paused {
+        " [PAUSED]".to_owned()
+    } else {
+        String::new()
+    };
     let title = format!(
         "Chudtendo | {} | {} | {} | cpu={} ppu={} timer={}{}",
         cartridge.title,
@@ -516,7 +664,7 @@ fn update_title(
         snapshot.cpu_steps,
         snapshot.ppu_frames,
         snapshot.timer_ticks,
-        pause_indicator,
+        status,
     );
 
     canvas
