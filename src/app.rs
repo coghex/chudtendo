@@ -23,7 +23,28 @@ pub enum RunMode {
     SmokeTest,
 }
 
-pub fn run(run_mode: RunMode, rom_path: Option<&Path>, dmg_mode: bool) -> Result<(), String> {
+/// Run the emulator with an optional agent callback. The callback receives a
+/// clone of the joypad and runs in a background thread while the SDL window
+/// is active. The emulator exits when the agent thread finishes or the window
+/// is closed, whichever comes first.
+pub fn run_with_agent<F>(run_mode: RunMode, rom_path: Option<&Path>, dmg_mode: bool, agent: F) -> Result<(), String>
+where
+    F: FnOnce(crate::input::JoypadState) + Send + 'static,
+{
+    run_inner(run_mode, rom_path, dmg_mode, 1.0, Some(Box::new(agent)))
+}
+
+pub fn run(run_mode: RunMode, rom_path: Option<&Path>, dmg_mode: bool, speed: f32) -> Result<(), String> {
+    run_inner(run_mode, rom_path, dmg_mode, speed, None)
+}
+
+fn run_inner(
+    run_mode: RunMode,
+    rom_path: Option<&Path>,
+    dmg_mode: bool,
+    speed: f32,
+    agent: Option<Box<dyn FnOnce(crate::input::JoypadState) + Send>>,
+) -> Result<(), String> {
     sdl2::hint::set("SDL_RENDER_SCALE_QUALITY", "nearest");
 
     let sdl = sdl2::init().map_err(|error| format!("failed to initialize SDL: {error}"))?;
@@ -79,6 +100,9 @@ pub fn run(run_mode: RunMode, rom_path: Option<&Path>, dmg_mode: bool) -> Result
             if dmg_mode {
                 emu.set_dmg_mode();
             }
+            if speed != 1.0 {
+                emu.set_speed(speed);
+            }
             emu
         }
         None => Emulator::new(),
@@ -103,6 +127,15 @@ pub fn run(run_mode: RunMode, rom_path: Option<&Path>, dmg_mode: bool) -> Result
     } else {
         None
     };
+
+    // Spawn agent thread if provided.
+    let _agent_thread = agent.map(|f| {
+        let joypad = emulator.joypad().clone();
+        std::thread::Builder::new()
+            .name("agent".to_owned())
+            .spawn(move || f(joypad))
+            .expect("failed to spawn agent thread")
+    });
 
     let shader = load_shader();
     let keybindings = Keybindings::load_or_default(Path::new("keybindings.yaml"));

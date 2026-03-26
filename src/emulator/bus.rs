@@ -114,6 +114,12 @@ impl Bus {
         let _ = self.apu.send(Command::LoadState(apu));
     }
 
+    pub fn request_ppu_features(&self) -> std::sync::mpsc::Receiver<super::component::PpuFeatures> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _ = self.ppu.send(Command::RequestPpuFeatures(tx));
+        rx
+    }
+
     pub fn propagate_hardware_mode(&self, hardware_mode: HardwareMode) {
         for sender in [&self.ppu, &self.wram, &self.timer, &self.cartridge, &self.apu] {
             let _ = sender.send(Command::SetHardwareMode(hardware_mode));

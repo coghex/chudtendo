@@ -106,7 +106,7 @@ impl TimerThread {
                         self.apply_save_state(state);
                     }
                 }
-                Ok(Command::Stop) => return false,
+                Ok(Command::RequestPpuFeatures(_)) => {} Ok(Command::Stop) => return false,
                 Err(TryRecvError::Empty) => return true,
                 Err(TryRecvError::Disconnected) => return false,
             }

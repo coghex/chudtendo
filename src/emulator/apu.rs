@@ -284,7 +284,7 @@ impl ApuThread {
                         self.apply_save_state(state);
                     }
                 }
-                Ok(Command::Stop) => return InboxResult::Stop,
+                Ok(Command::RequestPpuFeatures(_)) => {} Ok(Command::Stop) => return InboxResult::Stop,
                 Err(TryRecvError::Empty) => return InboxResult::Continue,
                 Err(TryRecvError::Disconnected) => return InboxResult::Stop,
             }

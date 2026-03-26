@@ -62,7 +62,7 @@ impl WramThread {
                             self.apply_save_state(state);
                         }
                     }
-                    Ok(Command::Stop) => {
+                    Ok(Command::RequestPpuFeatures(_)) => {} Ok(Command::Stop) => {
                         running = false;
                         break;
                     }

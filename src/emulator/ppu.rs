@@ -127,6 +127,7 @@ pub struct PpuThread {
     window_line: u8,
     rendering_vram: Vec<Vec<u8>>,
     rendering_oam: [u8; OAM_SIZE],
+    progress: super::component::PpuProgress,
 }
 
 #[derive(Debug)]
@@ -173,21 +174,25 @@ impl PpuThread {
         frame_ready: SyncSender<PublishedFrame>,
         frame_recycle: Receiver<Vec<u8>>,
         clock: MasterClock,
-    ) -> thread::JoinHandle<()> {
-        thread::Builder::new()
+    ) -> (thread::JoinHandle<()>, super::component::PpuProgress) {
+        let progress = super::component::PpuProgress::new();
+        let progress_clone = progress.clone();
+        let handle = thread::Builder::new()
             .name("ppu".to_owned())
             .spawn(move || {
-                Self::from_init_state(
+                let mut ppu = Self::from_init_state(
                     init_state,
                     bus,
                     interrupt_flags,
                     clock.clone(),
                     frame_ready,
                     frame_recycle,
-                )
-                .run(inbox, reports, clock)
+                );
+                ppu.progress = progress_clone;
+                ppu.run(inbox, reports, clock)
             })
-            .expect("failed to spawn ppu thread")
+            .expect("failed to spawn ppu thread");
+        (handle, progress)
     }
 
     fn run(
@@ -234,6 +239,19 @@ impl PpuThread {
                     if let Ok(state) = bincode::deserialize::<PpuSaveState>(&bytes) {
                         self.apply_save_state(state);
                     }
+                }
+                Ok(Command::RequestPpuFeatures(respond_to)) => {
+                    let features = super::component::PpuFeatures {
+                        oam: self.oam,
+                        lcdc: self.lcd_registers[LCDC_INDEX],
+                        stat: self.lcd_registers[STAT_INDEX],
+                        scy: self.lcd_registers[SCY_INDEX],
+                        scx: self.lcd_registers[SCX_INDEX],
+                        ly: self.lcd_registers[LY_INDEX],
+                        wy: self.lcd_registers[WY_INDEX],
+                        wx: self.lcd_registers[WX_INDEX],
+                    };
+                    let _ = respond_to.send(features);
                 }
                 Ok(Command::Stop) => return false,
                 Err(TryRecvError::Empty) => return true,
@@ -361,7 +379,10 @@ impl PpuThread {
                 value,
                 respond_to,
             } => {
-                self.chase_clock();
+                // Apply writes BEFORE chasing so dots aren't rendered
+                // with stale data.  The mode check uses the PPU's current
+                // position (slightly behind the CPU), which is more correct
+                // than checking after a potentially large chase.
                 let mode = if self.lcd_enabled() { self.current_mode() } else { 0 };
                 let result = match address {
                     0x8000..=0x9fff => {
@@ -588,6 +609,10 @@ impl PpuThread {
                     }
                     _ => WriteResult::NoData,
                 };
+                // Do NOT chase after writes. The run loop's advance_ppu
+                // (which checks the inbox every dot) will catch up and
+                // render with the updated data.  Chasing here would render
+                // many dots while OTHER queued writes sit unprocessed.
                 if let Some(respond_to) = respond_to {
                     let _ = respond_to.send(result);
                 }
@@ -638,6 +663,7 @@ impl PpuThread {
             window_line: 0,
             rendering_vram: vec![vec![0; VRAM_BANK_SIZE]; VRAM_BANKS],
             rendering_oam: init_state.oam,
+            progress: super::component::PpuProgress::new(),
         };
         ppu.lcd_registers[STAT_INDEX] |= STAT_UNUSED_MASK;
         ppu.refresh_scanline_defaults();
@@ -650,6 +676,7 @@ impl PpuThread {
         while self.dots < target {
             self.step_dot();
             self.dots += 1;
+            self.progress.set(self.dots);
         }
     }
 
@@ -661,6 +688,7 @@ impl PpuThread {
             }
             self.step_dot();
             self.dots += 1;
+            self.progress.set(self.dots);
         }
         true
     }
@@ -1125,7 +1153,7 @@ impl PpuThread {
 
         for sprite_index in 0..MAX_SPRITES {
             let base = sprite_index * OAM_ENTRY_SIZE;
-            let sprite_y = self.rendering_oam[base] as i16 - 16;
+            let sprite_y = self.oam[base] as i16 - 16;
 
             if (y as i16) < sprite_y || (y as i16) >= sprite_y + sprite_height {
                 continue;
@@ -1142,7 +1170,7 @@ impl PpuThread {
         // ties broken by OAM position. CGB: strictly by OAM position.
         if !matches!(self.hardware_mode, HardwareMode::Cgb) {
             visible[..visible_count].sort_by_key(|&i| {
-                let x = self.rendering_oam[i * OAM_ENTRY_SIZE + 1];
+                let x = self.oam[i * OAM_ENTRY_SIZE + 1];
                 (x, i as u8)
             });
         }
@@ -1161,10 +1189,10 @@ impl PpuThread {
         registers: ScanlineRegisters,
     ) {
         let base = sprite_index * OAM_ENTRY_SIZE;
-        let sprite_y = self.rendering_oam[base] as i16 - 16;
-        let sprite_x = self.rendering_oam[base + 1] as i16 - 8;
-        let mut tile_number = self.rendering_oam[base + 2];
-        let attributes = self.rendering_oam[base + 3];
+        let sprite_y = self.oam[base] as i16 - 16;
+        let sprite_x = self.oam[base + 1] as i16 - 8;
+        let mut tile_number = self.oam[base + 2];
+        let attributes = self.oam[base + 3];
         let line_in_sprite = y as i16 - sprite_y;
         let row_in_sprite = if attributes & SPRITE_ATTR_Y_FLIP_MASK != 0 {
             sprite_height - 1 - line_in_sprite
@@ -1270,9 +1298,9 @@ impl PpuThread {
         let tile_x = (map_x as usize / 8) & 0x1f;
         let tile_y = (map_y as usize / 8) & 0x1f;
         let map_index = tile_map_base + tile_y * 32 + tile_x;
-        let tile_number = self.rendering_vram[0][map_index];
+        let tile_number = self.vram_banks[0][map_index];
         let attributes = if matches!(self.hardware_mode, HardwareMode::Cgb) {
-            self.rendering_vram[1][map_index]
+            self.vram_banks[1][map_index]
         } else {
             0
         };
@@ -1327,10 +1355,8 @@ impl PpuThread {
     }
 
     fn snapshot_vram_for_rendering(&mut self) {
-        for (snapshot, live) in self.rendering_vram.iter_mut().zip(self.vram_banks.iter()) {
-            snapshot.copy_from_slice(live);
-        }
-        self.rendering_oam = self.oam;
+        // No-op: rendering now reads directly from live vram_banks/oam.
+        // Mode 3 VRAM write blocking ensures consistency during rendering.
     }
 
     fn tile_pixel(
@@ -1347,8 +1373,8 @@ impl PpuThread {
             (SIGNED_TILE_DATA_BASE + (tile_number as i8 as i32) * TILE_BYTES as i32) as usize
         };
         let row_base = tile_base + row_in_tile * 2;
-        let low = self.rendering_vram[tile_bank][row_base];
-        let high = self.rendering_vram[tile_bank][row_base + 1];
+        let low = self.vram_banks[tile_bank][row_base];
+        let high = self.vram_banks[tile_bank][row_base + 1];
         let bit = 7 - column_in_tile;
         ((high >> bit) & 0x01) << 1 | ((low >> bit) & 0x01)
     }

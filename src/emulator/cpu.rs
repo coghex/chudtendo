@@ -1,4 +1,6 @@
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError};
+use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
@@ -113,6 +115,9 @@ pub struct CpuThread {
     steps: u64,
     shutdown: bool,
     pacing_epoch: Option<Instant>,
+    /// Speed multiplier as fixed-point: 100 = 1.0x, 200 = 2.0x, 0 = uncapped.
+    speed: Arc<AtomicU32>,
+    ppu_progress: super::component::PpuProgress,
 }
 
 impl CpuThread {
@@ -144,14 +149,22 @@ impl CpuThread {
                 break;
             }
 
-            let start = self.pacing_epoch.unwrap();
-            let elapsed_nanos = start.elapsed().as_nanos() as u64;
-            let wall_target = elapsed_nanos
-                .checked_mul(super::component::CPU_CLOCK_HZ)
-                .map(|n| n / 1_000_000_000)
-                .unwrap_or(u64::MAX);
+            let speed = self.speed.load(Ordering::Relaxed);
+            let should_run = if speed == 0 {
+                true // Uncapped: no wall-clock pacing.
+            } else {
+                let start = self.pacing_epoch.unwrap();
+                let elapsed_nanos = start.elapsed().as_nanos() as u128;
+                // Use u128 to avoid overflow: nanos * Hz * speed can exceed u64
+                // after ~22 seconds at 2x speed.
+                let wall_target = elapsed_nanos
+                    * super::component::CPU_CLOCK_HZ as u128
+                    * speed as u128
+                    / 100_000_000_000;
+                self.cycles < wall_target as u64
+            };
 
-            if self.cycles < wall_target {
+            if should_run {
                 let cycles_before = self.cycles;
                 for _ in 0..INSTRUCTIONS_PER_QUANTUM {
                     self.service_inbox(&inbox);
@@ -164,6 +177,27 @@ impl CpuThread {
                     self.cycles += INSTRUCTIONS_PER_QUANTUM as u64 * 4;
                 }
                 clock.advance(self.cycles);
+                // Keep the CPU within one scanline (456 dots) of the PPU.
+                // Without this, at high speeds the CPU outruns the PPU and
+                // VRAM writes queue up, causing tile glitches.
+                // Service inbox during the wait so SaveState/LoadState
+                // commands don't deadlock.
+                // Keep the CPU within one scanline (456 dots) of the PPU.
+                const MAX_LEAD: u64 = 456;
+                let before_wait = Instant::now();
+                while self.cycles > self.ppu_progress.get() + MAX_LEAD {
+                    self.service_inbox(&inbox);
+                    if self.shutdown { break; }
+                    thread::yield_now();
+                }
+                // Shift the pacing epoch forward by the wait duration so the
+                // CPU doesn't try to "catch up" after a stall.
+                let waited = before_wait.elapsed();
+                if waited > std::time::Duration::from_millis(1) {
+                    if let Some(ref mut epoch) = self.pacing_epoch {
+                        *epoch += waited;
+                    }
+                }
             } else {
                 thread::yield_now();
             }
@@ -630,7 +664,7 @@ impl CpuThread {
                         self.apply_save_state(state);
                     }
                 }
-                Ok(Command::Stop) => {
+                Ok(Command::RequestPpuFeatures(_)) => {} Ok(Command::Stop) => {
                     self.shutdown = true;
                     break;
                 }
@@ -704,11 +738,12 @@ impl CpuThread {
         }
         self.clock.store(state.cycles);
         // Backdate the pacing epoch so wall_target matches self.cycles right now.
-        // This prevents both racing (epoch too old) and freezing (epoch too new).
-        let elapsed_nanos = self.cycles
-            .saturating_mul(1_000_000_000)
-            / super::component::CPU_CLOCK_HZ;
-        self.pacing_epoch = Some(Instant::now() - std::time::Duration::from_nanos(elapsed_nanos));
+        // Must account for the speed multiplier — at 2x speed, the same number
+        // of cycles corresponds to half the wall-clock time.
+        let speed = self.speed.load(Ordering::Relaxed).max(1) as u128;
+        let elapsed_nanos = (self.cycles as u128 * 100_000_000_000)
+            / (super::component::CPU_CLOCK_HZ as u128 * speed);
+        self.pacing_epoch = Some(Instant::now() - std::time::Duration::from_nanos(elapsed_nanos as u64));
     }
 
     fn read_byte(&mut self, inbox: &Receiver<Command>, address: u16) -> u8 {
@@ -1287,6 +1322,8 @@ impl CpuThread {
             steps: 0,
             shutdown: false,
             pacing_epoch: None,
+            speed: init_state.speed,
+            ppu_progress: init_state.ppu_progress,
         }
     }
 

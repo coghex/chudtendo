@@ -119,6 +119,8 @@ pub struct Emulator {
     joypad: crate::input::JoypadState,
     cached_snapshot: Snapshot,
     workers: Vec<WorkerHandle>,
+    speed: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    ppu_progress: Option<component::PpuProgress>,
 }
 
 impl Emulator {
@@ -166,6 +168,8 @@ impl Emulator {
             joypad: crate::input::JoypadState::new(),
             cached_snapshot: Snapshot::default(),
             workers: Vec::new(),
+            speed: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(100)),
+            ppu_progress: None,
         }
     }
 
@@ -243,6 +247,7 @@ impl Emulator {
         cpu_init.joypad = self.joypad.clone();
         cpu_init.serial_output = self.serial_output_sender.take();
         cpu_init.interrupt_flags = interrupt_flags.clone();
+        cpu_init.speed = self.speed.clone();
         if is_dmg_boot {
             cpu_init.hardware_mode = HardwareMode::DmgCompatibility;
             cpu_init.boot_target_mode = HardwareMode::DmgCompatibility;
@@ -303,6 +308,22 @@ impl Emulator {
         let clock = MasterClock::new();
         self.clock = Some(clock.clone());
 
+        let (ppu_handle, ppu_progress) = ppu::PpuThread::spawn(
+            ppu_init,
+            self.bus.clone(),
+            interrupt_flags.clone(),
+            ppu_inbox,
+            report_sender.clone(),
+            frame_ready_sender,
+            frame_recycle_receiver,
+            clock.clone(),
+        );
+        self.workers.push(WorkerHandle {
+            name: "ppu",
+            handle: ppu_handle,
+        });
+        self.ppu_progress = Some(ppu_progress.clone());
+        cpu_init.ppu_progress = ppu_progress;
         self.workers.push(WorkerHandle {
             name: "cpu",
             handle: cpu::CpuThread::spawn(
@@ -310,19 +331,6 @@ impl Emulator {
                 self.bus.clone(),
                 cpu_inbox,
                 report_sender.clone(),
-                clock.clone(),
-            ),
-        });
-        self.workers.push(WorkerHandle {
-            name: "ppu",
-            handle: ppu::PpuThread::spawn(
-                ppu_init,
-                self.bus.clone(),
-                interrupt_flags.clone(),
-                ppu_inbox,
-                report_sender.clone(),
-                frame_ready_sender,
-                frame_recycle_receiver,
                 clock.clone(),
             ),
         });
@@ -613,6 +621,13 @@ impl Emulator {
             clock.store(full.clock_cycles);
         }
 
+        // Reset PPU progress to match the loaded clock so the CPU doesn't
+        // block waiting for the PPU to catch up from an old position.
+        // The PPU will update this to its actual position on its next advance.
+        if let Some(ref progress) = self.ppu_progress {
+            progress.set(full.clock_cycles);
+        }
+
         self.bus.load_state_components([
             full.cpu,
             full.ppu,
@@ -626,6 +641,28 @@ impl Emulator {
     }
 
     // --- Headless agent API ---
+
+    /// Get PPU OAM + LCD registers in a single command (no bus reads).
+    pub fn ppu_features(&self) -> Option<component::PpuFeatures> {
+        let rx = self.bus.request_ppu_features();
+        // Brief poll — PPU should respond within a few ms.
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Ok(features) = rx.try_recv() {
+                return Some(features);
+            }
+            if std::time::Instant::now() > deadline {
+                return None;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// Set emulator speed multiplier. 1.0 = normal, 2.0 = double, 0.0 = uncapped.
+    pub fn set_speed(&self, multiplier: f32) {
+        let fixed = if multiplier <= 0.0 { 0 } else { (multiplier * 100.0) as u32 };
+        self.speed.store(fixed, std::sync::atomic::Ordering::Relaxed);
+    }
 
     /// Mute audio by dropping the sample receiver. The APU's `try_send`
     /// silently fails on the disconnected channel, so no samples accumulate
@@ -668,12 +705,18 @@ impl Emulator {
         for offset in 0..len {
             let addr = start.wrapping_add(offset);
             let mut pending = self.bus.read(addr);
+            let read_start = std::time::Instant::now();
             loop {
                 if let Some(result) = pending.try_take() {
                     data.push(match result {
                         ReadResult::Ready(v) => v,
                         ReadResult::NoData => 0xff,
                     });
+                    break;
+                }
+                if read_start.elapsed() > Duration::from_secs(2) {
+                    eprintln!("[read_range] TIMEOUT reading addr 0x{addr:04x} (offset {offset}/{len})");
+                    data.push(0xff);
                     break;
                 }
                 std::thread::yield_now();
@@ -1357,11 +1400,11 @@ mod tests {
 
     #[test]
     fn unsupported_mbc_types_fail_before_runtime() {
-        let rom = build_test_rom("MBC6TEST", 0xc0, 0x00, 0x20, 0x01, 0x03);
+        let rom = build_test_rom("UNKTEST", 0xc0, 0x00, 0xbf, 0x01, 0x03);
 
         assert_eq!(
             Emulator::from_rom_bytes(rom).unwrap_err(),
-            CartridgeLoadError::UnsupportedMbc(MbcKind::Mbc6Stub)
+            CartridgeLoadError::UnsupportedMbc(MbcKind::UnknownStub(0xbf))
         );
     }
 

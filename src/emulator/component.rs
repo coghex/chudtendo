@@ -66,8 +66,28 @@ impl MasterClock {
         self.target_cycle.store(cycles, Ordering::Release);
     }
 
-    pub fn store(&self, cycles: u64) {
-        self.target_cycle.store(cycles, Ordering::Release);
+    pub fn store(&self, value: u64) {
+        self.target_cycle.store(value, Ordering::Release);
+    }
+}
+
+/// Shared PPU dot counter — lets the CPU know how far the PPU has advanced.
+#[derive(Clone, Debug)]
+pub struct PpuProgress {
+    dots: Arc<AtomicU64>,
+}
+
+impl PpuProgress {
+    pub fn new() -> Self {
+        Self { dots: Arc::new(AtomicU64::new(0)) }
+    }
+
+    pub fn get(&self) -> u64 {
+        self.dots.load(Ordering::Acquire)
+    }
+
+    pub fn set(&self, dots: u64) {
+        self.dots.store(dots, Ordering::Release);
     }
 }
 
@@ -150,12 +170,25 @@ pub struct PublishedFrame {
     pub published_at: Instant,
 }
 
+#[derive(Clone, Debug)]
+pub struct PpuFeatures {
+    pub oam: [u8; 160],
+    pub lcdc: u8,
+    pub stat: u8,
+    pub scy: u8,
+    pub scx: u8,
+    pub ly: u8,
+    pub wy: u8,
+    pub wx: u8,
+}
+
 #[derive(Debug)]
 pub enum Command {
     Memory(MemoryCommand),
     SetHardwareMode(HardwareMode),
     SaveState(std::sync::mpsc::Sender<Vec<u8>>),
     LoadState(Vec<u8>),
+    RequestPpuFeatures(std::sync::mpsc::Sender<PpuFeatures>),
     Stop,
 }
 
@@ -315,6 +348,9 @@ pub struct CpuInitState {
     pub joypad: JoypadState,
     pub serial_output: Option<std::sync::mpsc::SyncSender<u8>>,
     pub interrupt_flags: InterruptFlags,
+    /// Speed multiplier: 100 = 1.0x, 200 = 2.0x, 0 = uncapped.
+    pub speed: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    pub ppu_progress: PpuProgress,
 }
 
 impl Default for CpuInitState {
@@ -330,6 +366,8 @@ impl Default for CpuInitState {
             joypad: JoypadState::new(),
             serial_output: None,
             interrupt_flags: InterruptFlags::new(),
+            speed: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(100)),
+            ppu_progress: PpuProgress::new(),
         }
     }
 }
