@@ -256,7 +256,7 @@ impl Action {
         }
     }
 
-    fn config_key(self) -> &'static str {
+    pub fn config_key(self) -> &'static str {
         match self {
             Self::Up => "key_up",
             Self::Down => "key_down",

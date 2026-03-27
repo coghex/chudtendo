@@ -1,4 +1,4 @@
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(feature = "qt")))]
 #[macro_use]
 extern crate objc;
 
@@ -7,6 +7,8 @@ pub mod emulator;
 pub mod input;
 pub mod menu;
 pub mod preferences;
+#[cfg(feature = "qt")]
+pub mod qt_ffi;
 pub mod settings;
 pub mod shader;
 

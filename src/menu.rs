@@ -26,7 +26,7 @@ pub type SlotInfoFn = Box<dyn Fn() -> Vec<SlotInfo> + Send>;
 /// Shared current window scale so the menu can show a checkmark.
 pub type SharedScale = std::sync::Arc<std::sync::atomic::AtomicU32>;
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(feature = "qt")))]
 mod platform {
     use super::{MenuAction, SlotInfoFn};
 
@@ -564,14 +564,260 @@ mod platform {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+// ---------------------------------------------------------------------------
+// Windows — Win32 menus via the `windows` crate
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "windows")]
+mod platform {
+    use super::{MenuAction, SlotInfoFn};
+    use std::sync::mpsc;
+    use std::sync::Mutex;
+
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::*;
+
+    static MENU_SENDER: Mutex<Option<mpsc::SyncSender<MenuAction>>> = Mutex::new(None);
+    static SLOT_INFO_FN: Mutex<Option<SlotInfoFn>> = Mutex::new(None);
+    static SHARED_SCALE: Mutex<Option<super::SharedScale>> = Mutex::new(None);
+    static PREV_WNDPROC: Mutex<Option<WNDPROC>> = Mutex::new(None);
+
+    fn send_action(action: MenuAction) {
+        if let Some(ref sender) = *MENU_SENDER.lock().unwrap() {
+            let _ = sender.try_send(action);
+        }
+    }
+
+    // Menu command IDs.
+    const CMD_LOAD_ROM: u16 = 100;
+    const CMD_QUIT: u16 = 101;
+    const CMD_PAUSE: u16 = 200;
+    const CMD_RESET: u16 = 201;
+    const CMD_FAST_FORWARD: u16 = 202;
+    const CMD_REWIND: u16 = 203;
+    const CMD_SETTINGS: u16 = 204;
+    const CMD_SAVE_BASE: u16 = 300; // 300-307 for slots 1-8
+    const CMD_LOAD_BASE: u16 = 310; // 310-317 for slots 1-8
+    const CMD_SCALE_BASE: u16 = 400; // 400-407 for 1x-8x
+
+    unsafe extern "system" fn subclass_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if msg == WM_COMMAND {
+            let cmd = (wparam.0 & 0xFFFF) as u16;
+            match cmd {
+                CMD_LOAD_ROM => send_action(MenuAction::LoadRom),
+                CMD_QUIT => send_action(MenuAction::Quit),
+                CMD_PAUSE => send_action(MenuAction::Pause),
+                CMD_RESET => send_action(MenuAction::Reset),
+                CMD_FAST_FORWARD => send_action(MenuAction::ToggleFastForward),
+                CMD_REWIND => send_action(MenuAction::ToggleRewind),
+                CMD_SETTINGS => send_action(MenuAction::OpenSettings),
+                c if c >= CMD_SAVE_BASE && c < CMD_SAVE_BASE + 8 => {
+                    send_action(MenuAction::SaveState(c - CMD_SAVE_BASE + 1));
+                }
+                c if c >= CMD_LOAD_BASE && c < CMD_LOAD_BASE + 8 => {
+                    send_action(MenuAction::LoadState(c - CMD_LOAD_BASE + 1));
+                }
+                c if c >= CMD_SCALE_BASE && c < CMD_SCALE_BASE + 8 => {
+                    send_action(MenuAction::SetScale((c - CMD_SCALE_BASE + 1) as u32));
+                }
+                _ => {}
+            }
+        }
+
+        // Call the original window procedure.
+        let prev = PREV_WNDPROC.lock().unwrap();
+        if let Some(Some(proc_fn)) = prev.as_ref() {
+            CallWindowProcW(Some(*proc_fn), hwnd, msg, wparam, lparam)
+        } else {
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+    }
+
+    unsafe fn append_string(menu: HMENU, id: u16, text: &str) {
+        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        let _ = AppendMenuW(menu, MF_STRING, id as usize, windows::core::PCWSTR(wide.as_ptr()));
+    }
+
+    unsafe fn append_submenu(parent: HMENU, submenu: HMENU, text: &str) {
+        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        let _ = AppendMenuW(
+            parent,
+            MF_POPUP,
+            submenu.0 as usize,
+            windows::core::PCWSTR(wide.as_ptr()),
+        );
+    }
+
+    unsafe fn append_separator(menu: HMENU) {
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
+    }
+
+    pub fn install_menu_bar(
+        slot_info_fn: SlotInfoFn,
+        shared_scale: super::SharedScale,
+    ) -> mpsc::Receiver<MenuAction> {
+        let (sender, receiver) = mpsc::sync_channel(16);
+        *MENU_SENDER.lock().unwrap() = Some(sender);
+        *SLOT_INFO_FN.lock().unwrap() = Some(slot_info_fn);
+        *SHARED_SCALE.lock().unwrap() = Some(shared_scale);
+
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            if hwnd.0.is_null() {
+                eprintln!("Warning: could not get foreground window for menu bar");
+                return receiver;
+            }
+
+            let menu_bar = CreateMenu().expect("CreateMenu failed");
+
+            // --- File menu ---
+            let file_menu = CreatePopupMenu().expect("CreatePopupMenu failed");
+            append_string(file_menu, CMD_LOAD_ROM, "Load ROM...\tCtrl+O");
+            append_separator(file_menu);
+            append_string(file_menu, CMD_QUIT, "Quit\tCtrl+Q");
+            append_submenu(menu_bar, file_menu, "&File");
+
+            // --- Emulation menu ---
+            let emu_menu = CreatePopupMenu().expect("CreatePopupMenu failed");
+            append_string(emu_menu, CMD_PAUSE, "Pause\tCtrl+P");
+            append_string(emu_menu, CMD_RESET, "Reset\tCtrl+R");
+            append_string(emu_menu, CMD_FAST_FORWARD, "Fast Forward\tCtrl+F");
+            append_string(emu_menu, CMD_REWIND, "Rewind\tCtrl+W");
+            append_separator(emu_menu);
+
+            // Save State submenu
+            let save_menu = CreatePopupMenu().expect("CreatePopupMenu failed");
+            for i in 0..8u16 {
+                let label = format!("Slot {}\tF{}", i + 1, i + 1);
+                append_string(save_menu, CMD_SAVE_BASE + i, &label);
+            }
+            append_submenu(emu_menu, save_menu, "Save State");
+
+            // Load State submenu
+            let load_menu = CreatePopupMenu().expect("CreatePopupMenu failed");
+            for i in 0..8u16 {
+                let label = format!("Slot {}\tShift+F{}", i + 1, i + 1);
+                append_string(load_menu, CMD_LOAD_BASE + i, &label);
+            }
+            append_submenu(emu_menu, load_menu, "Load State");
+
+            append_separator(emu_menu);
+            append_string(emu_menu, CMD_SETTINGS, "Settings...\tCtrl+,");
+            append_submenu(menu_bar, emu_menu, "&Emulation");
+
+            // --- View menu ---
+            let view_menu = CreatePopupMenu().expect("CreatePopupMenu failed");
+            let scale_menu = CreatePopupMenu().expect("CreatePopupMenu failed");
+            for i in 0..8u16 {
+                let label = format!("{}x\tCtrl+{}", i + 1, i + 1);
+                append_string(scale_menu, CMD_SCALE_BASE + i, &label);
+            }
+            append_submenu(view_menu, scale_menu, "Scale");
+            append_submenu(menu_bar, view_menu, "&View");
+
+            // Attach menu to window.
+            let _ = SetMenu(hwnd, menu_bar);
+            let _ = DrawMenuBar(hwnd);
+
+            // Subclass the window to intercept WM_COMMAND.
+            let prev = SetWindowLongPtrW(hwnd, GWL_WNDPROC, subclass_proc as isize);
+            *PREV_WNDPROC.lock().unwrap() = if prev != 0 {
+                Some(std::mem::transmute::<isize, WNDPROC>(prev))
+            } else {
+                None
+            };
+        }
+
+        receiver
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Linux — Qt menu bar (placeholder, requires Qt dev headers)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Qt backend — used on Linux, or any platform with `--features qt`
+// ---------------------------------------------------------------------------
+
+#[cfg(any(target_os = "linux", feature = "qt"))]
 mod platform {
     use super::{MenuAction, SlotInfoFn};
     use std::sync::mpsc;
 
-    pub fn install_menu_bar(_slot_info_fn: SlotInfoFn, _shared_scale: super::SharedScale) -> mpsc::Receiver<MenuAction> {
+    pub fn install_menu_bar(
+        _slot_info_fn: SlotInfoFn,
+        _shared_scale: super::SharedScale,
+    ) -> mpsc::Receiver<MenuAction> {
+        let (sender, receiver) = mpsc::sync_channel(16);
+
+        unsafe {
+            crate::qt_ffi::qt_init(std::ptr::null_mut(), std::ptr::null_mut());
+            crate::qt_ffi::qt_create_menubar();
+        }
+
+        // Spawn a polling thread that pumps Qt events and forwards actions.
+        std::thread::Builder::new()
+            .name("qt-event-pump".to_owned())
+            .spawn(move || {
+                loop {
+                    unsafe { crate::qt_ffi::qt_process_events(); }
+
+                    // Drain all queued actions.
+                    loop {
+                        let code = unsafe { crate::qt_ffi::qt_poll_action() };
+                        if code == 0 { break; }
+                        if let Some(action) = decode_qt_action(code) {
+                            if sender.try_send(action).is_err() {
+                                return; // receiver dropped, app shutting down
+                            }
+                        }
+                    }
+
+                    std::thread::sleep(std::time::Duration::from_millis(16));
+                }
+            })
+            .expect("failed to spawn Qt event pump thread");
+
+        receiver
+    }
+
+    fn decode_qt_action(code: i32) -> Option<MenuAction> {
+        match code {
+            1 => Some(MenuAction::LoadRom),
+            2 => Some(MenuAction::Quit),
+            3 => Some(MenuAction::Pause),
+            4 => Some(MenuAction::Reset),
+            5 => Some(MenuAction::ToggleFastForward),
+            6 => Some(MenuAction::ToggleRewind),
+            7 => Some(MenuAction::OpenSettings),
+            c if c >= 101 && c <= 108 => Some(MenuAction::SaveState((c - 100) as u8)),
+            c if c >= 201 && c <= 208 => Some(MenuAction::LoadState((c - 200) as u8)),
+            c if c >= 301 && c <= 308 => Some(MenuAction::SetScale((c - 300) as u32)),
+            _ => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fallback for other platforms
+// ---------------------------------------------------------------------------
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux", feature = "qt")))]
+mod platform {
+    use super::{MenuAction, SlotInfoFn};
+    use std::sync::mpsc;
+
+    pub fn install_menu_bar(
+        _slot_info_fn: SlotInfoFn,
+        _shared_scale: super::SharedScale,
+    ) -> mpsc::Receiver<MenuAction> {
         let (_sender, receiver) = mpsc::sync_channel(16);
-        // No native menu bar on this platform yet (Phase 6).
         receiver
     }
 }

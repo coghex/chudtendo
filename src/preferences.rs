@@ -16,18 +16,26 @@ pub enum SettingsChanged {
 /// Returns a receiver the event loop should poll.
 pub fn install_settings_channel() -> std::sync::mpsc::Receiver<SettingsChanged> {
     let (tx, rx) = std::sync::mpsc::sync_channel(16);
-    #[cfg(target_os = "macos")]
+    #[cfg(any(
+        all(target_os = "macos", not(feature = "qt")),
+        target_os = "windows",
+        feature = "qt",
+    ))]
     {
         *platform::SETTINGS_SENDER.lock().unwrap() = Some(tx);
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(
+        all(target_os = "macos", not(feature = "qt")),
+        target_os = "windows",
+        feature = "qt",
+    )))]
     {
         let _ = tx;
     }
     rx
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(feature = "qt")))]
 mod platform {
     use cocoa::appkit::*;
     use cocoa::base::{id, nil, selector, BOOL, NO, YES};
@@ -899,10 +907,464 @@ mod platform {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+// ---------------------------------------------------------------------------
+// Windows — Win32 preferences dialog
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "windows")]
+mod platform {
+    use std::sync::Mutex;
+
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::*;
+    use windows::Win32::Graphics::Gdi::*;
+    use windows::Win32::UI::Controls::*;
+    use windows::Win32::UI::WindowsAndMessaging::*;
+
+    use crate::settings::{
+        Action, ControlsSettings, DisplaySettings, EmulationSettings, WindowMode,
+    };
+
+    pub static SETTINGS_SENDER: Mutex<
+        Option<std::sync::mpsc::SyncSender<super::SettingsChanged>>,
+    > = Mutex::new(None);
+
+    fn notify(kind: super::SettingsChanged) {
+        if let Some(ref tx) = *SETTINGS_SENDER.lock().unwrap() {
+            let _ = tx.try_send(kind);
+        }
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    // Control IDs for the preferences dialog.
+    const ID_TAB: i32 = 1000;
+    const ID_FF_SPEED: i32 = 1100;
+    const ID_REWIND_BUF: i32 = 1101;
+    const ID_BOOT_ROM: i32 = 1102;
+    const ID_SAVE_EMU: i32 = 1103;
+    const ID_DEFAULTS_EMU: i32 = 1104;
+    const ID_SCALE: i32 = 1200;
+    const ID_WIN_MODE: i32 = 1201;
+    const ID_VSYNC: i32 = 1202;
+    const ID_FRAME_LIMIT: i32 = 1203;
+    const ID_SAVE_DISPLAY: i32 = 1204;
+    const ID_DEFAULTS_DISPLAY: i32 = 1205;
+    const ID_SAVE_CONTROLS: i32 = 1300;
+    const ID_DEFAULTS_CONTROLS: i32 = 1301;
+    const ID_CONTROLS_LIST: i32 = 1302;
+
+    const FF_SPEEDS: &[(&str, f32)] = &[
+        ("2x", 2.0), ("4x", 4.0), ("8x", 8.0), ("Uncapped", 0.0),
+    ];
+    const REWIND_SIZES: &[(&str, u32)] = &[
+        ("10 seconds", 10), ("30 seconds", 30), ("60 seconds", 60), ("120 seconds", 120),
+    ];
+
+    static PREFS_HWND: Mutex<Option<isize>> = Mutex::new(None);
+
+    unsafe fn create_label(parent: HWND, text: &str, x: i32, y: i32, w: i32, h: i32) {
+        let cls = wide("STATIC");
+        let txt = wide(text);
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0), PCWSTR(cls.as_ptr()), PCWSTR(txt.as_ptr()),
+            WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_RIGHT as u32),
+            x, y, w, h, parent, HMENU(0 as _), None, None,
+        );
+    }
+
+    unsafe fn create_combo(parent: HWND, id: i32, items: &[&str], x: i32, y: i32, w: i32, h: i32) -> HWND {
+        let cls = wide("COMBOBOX");
+        let combo = CreateWindowExW(
+            WINDOW_EX_STYLE(0), PCWSTR(cls.as_ptr()), PCWSTR::null(),
+            WS_CHILD | WS_VISIBLE | WINDOW_STYLE(CBS_DROPDOWNLIST as u32 | CBS_HASSTRINGS as u32),
+            x, y, w, h, parent, HMENU(id as _), None, None,
+        ).unwrap_or(HWND(std::ptr::null_mut()));
+
+        for item in items {
+            let witem = wide(item);
+            SendMessageW(combo, CB_ADDSTRING, WPARAM(0), LPARAM(witem.as_ptr() as isize));
+        }
+        combo
+    }
+
+    unsafe fn create_button(parent: HWND, id: i32, text: &str, x: i32, y: i32, w: i32, h: i32) {
+        let cls = wide("BUTTON");
+        let txt = wide(text);
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0), PCWSTR(cls.as_ptr()), PCWSTR(txt.as_ptr()),
+            WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+            x, y, w, h, parent, HMENU(id as _), None, None,
+        );
+    }
+
+    unsafe fn create_checkbox(parent: HWND, id: i32, text: &str, x: i32, y: i32, w: i32, h: i32) -> HWND {
+        let cls = wide("BUTTON");
+        let txt = wide(text);
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0), PCWSTR(cls.as_ptr()), PCWSTR(txt.as_ptr()),
+            WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
+            x, y, w, h, parent, HMENU(id as _), None, None,
+        ).unwrap_or(HWND(std::ptr::null_mut()))
+    }
+
+    unsafe fn create_edit(parent: HWND, id: i32, text: &str, x: i32, y: i32, w: i32, h: i32) -> HWND {
+        let cls = wide("EDIT");
+        let txt = wide(text);
+        CreateWindowExW(
+            WS_EX_CLIENTEDGE, PCWSTR(cls.as_ptr()), PCWSTR(txt.as_ptr()),
+            WS_CHILD | WS_VISIBLE | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+            x, y, w, h, parent, HMENU(id as _), None, None,
+        ).unwrap_or(HWND(std::ptr::null_mut()))
+    }
+
+    unsafe fn combo_select(hwnd: HWND, idx: i32) {
+        SendMessageW(hwnd, CB_SETCURSEL, WPARAM(idx as usize), LPARAM(0));
+    }
+
+    unsafe fn combo_index(hwnd: HWND) -> i32 {
+        SendMessageW(hwnd, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as i32
+    }
+
+    unsafe fn get_dlg_item(hwnd: HWND, id: i32) -> HWND {
+        GetDlgItem(hwnd, id).unwrap_or(HWND(std::ptr::null_mut()))
+    }
+
+    unsafe fn get_window_text(hwnd: HWND) -> String {
+        let mut buf = [0u16; 256];
+        let len = GetWindowTextW(hwnd, &mut buf);
+        String::from_utf16_lossy(&buf[..len as usize])
+    }
+
+    unsafe fn handle_command(hwnd: HWND, cmd: i32) {
+        match cmd {
+            x if x == ID_SAVE_EMU => {
+                let ff_idx = combo_index(get_dlg_item(hwnd, ID_FF_SPEED)) as usize;
+                let rw_idx = combo_index(get_dlg_item(hwnd, ID_REWIND_BUF)) as usize;
+                let br_idx = combo_index(get_dlg_item(hwnd, ID_BOOT_ROM)) as usize;
+                let settings = EmulationSettings {
+                    ff_speed: FF_SPEEDS.get(ff_idx).map(|&(_, v)| v).unwrap_or(0.0),
+                    rewind_buffer_seconds: REWIND_SIZES.get(rw_idx).map(|&(_, v)| v).unwrap_or(30),
+                    boot_rom: if br_idx == 1 { "dmg" } else { "cgb" }.to_owned(),
+                };
+                settings.save();
+                notify(super::SettingsChanged::Emulation);
+            }
+            x if x == ID_DEFAULTS_EMU => {
+                let d = EmulationSettings::default();
+                let idx = FF_SPEEDS.iter().position(|&(_, v)| v == d.ff_speed).unwrap_or(3);
+                combo_select(get_dlg_item(hwnd, ID_FF_SPEED), idx as i32);
+                let idx = REWIND_SIZES.iter().position(|&(_, v)| v == d.rewind_buffer_seconds).unwrap_or(1);
+                combo_select(get_dlg_item(hwnd, ID_REWIND_BUF), idx as i32);
+                combo_select(get_dlg_item(hwnd, ID_BOOT_ROM), 0);
+            }
+            x if x == ID_SAVE_DISPLAY => {
+                let scale_idx = combo_index(get_dlg_item(hwnd, ID_SCALE)) as usize;
+                let mode_idx = combo_index(get_dlg_item(hwnd, ID_WIN_MODE)) as usize;
+                let vsync_hwnd = get_dlg_item(hwnd, ID_VSYNC);
+                let vsync = SendMessageW(vsync_hwnd, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 != 0;
+                let fl_text = get_window_text(get_dlg_item(hwnd, ID_FRAME_LIMIT));
+                let settings = DisplaySettings {
+                    window_scale: (scale_idx as u32 + 1).min(8),
+                    window_mode: WindowMode::ALL.get(mode_idx).copied().unwrap_or(WindowMode::Windowed),
+                    vsync,
+                    frame_limit: fl_text.parse().unwrap_or(0),
+                };
+                settings.save();
+                notify(super::SettingsChanged::Display);
+            }
+            x if x == ID_DEFAULTS_DISPLAY => {
+                let d = DisplaySettings::default();
+                combo_select(get_dlg_item(hwnd, ID_SCALE), (d.window_scale - 1) as i32);
+                combo_select(get_dlg_item(hwnd, ID_WIN_MODE), 0);
+                let state = if d.vsync { BST_CHECKED } else { BST_UNCHECKED };
+                SendMessageW(get_dlg_item(hwnd, ID_VSYNC), BM_SETCHECK, WPARAM(state.0 as usize), LPARAM(0));
+                let txt = wide(&d.frame_limit.to_string());
+                SetWindowTextW(get_dlg_item(hwnd, ID_FRAME_LIMIT), PCWSTR(txt.as_ptr()));
+            }
+            x if x == ID_SAVE_CONTROLS => {
+                // TODO: read from list view and save
+                let controls = ControlsSettings::load();
+                controls.save();
+                notify(super::SettingsChanged::Controls);
+            }
+            x if x == ID_DEFAULTS_CONTROLS => {
+                // TODO: reset list view to defaults
+            }
+            _ => {}
+        }
+    }
+
+    unsafe extern "system" fn prefs_wndproc(
+        hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM,
+    ) -> LRESULT {
+        match msg {
+            WM_COMMAND => {
+                let cmd = (wparam.0 & 0xFFFF) as i32;
+                handle_command(hwnd, cmd);
+                LRESULT(0)
+            }
+            WM_DESTROY => {
+                *PREFS_HWND.lock().unwrap() = None;
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+
+    pub fn open_preferences_window() {
+        // Don't open multiple instances.
+        if PREFS_HWND.lock().unwrap().is_some() {
+            return;
+        }
+
+        unsafe {
+            let class_name = wide("ChudtendoPrefs");
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(prefs_wndproc),
+                lpszClassName: PCWSTR(class_name.as_ptr()),
+                hbrBackground: HBRUSH((COLOR_BTNFACE.0 + 1) as _),
+                ..Default::default()
+            };
+            RegisterClassW(&wc);
+
+            let title = wide("Settings");
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+                CW_USEDEFAULT, CW_USEDEFAULT, 520, 460,
+                HWND(std::ptr::null_mut()), HMENU(std::ptr::null_mut()), None, None,
+            ).unwrap_or(HWND(std::ptr::null_mut()));
+
+            if hwnd.0.is_null() {
+                eprintln!("Failed to create preferences window");
+                return;
+            }
+
+            *PREFS_HWND.lock().unwrap() = Some(hwnd.0 as isize);
+
+            // Create tab control.
+            let tab_cls = wide("SysTabControl32");
+            let tab_hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE(0), PCWSTR(tab_cls.as_ptr()), PCWSTR::null(),
+                WS_CHILD | WS_VISIBLE | WINDOW_STYLE(TCS_TABS as u32),
+                5, 5, 500, 410,
+                hwnd, HMENU(ID_TAB as _), None, None,
+            ).unwrap_or(HWND(std::ptr::null_mut()));
+
+            // Add tabs.
+            for (i, name) in ["Emulation", "Display", "Controls"].iter().enumerate() {
+                let wname = wide(name);
+                let mut item = TCITEMW {
+                    mask: TCIF_TEXT,
+                    pszText: windows::core::PWSTR(wname.as_ptr() as *mut u16),
+                    ..Default::default()
+                };
+                SendMessageW(
+                    tab_hwnd,
+                    TCM_INSERTITEMW,
+                    WPARAM(i),
+                    LPARAM(&mut item as *mut _ as isize),
+                );
+            }
+
+            // --- Emulation tab controls ---
+            let ox = 20;
+            let oy = 40;
+            create_label(hwnd, "Fast Forward Speed:", ox, oy, 160, 22);
+            let ff = create_combo(
+                hwnd, ID_FF_SPEED,
+                &FF_SPEEDS.iter().map(|&(n, _)| n).collect::<Vec<_>>(),
+                ox + 170, oy, 180, 200,
+            );
+            let emu = EmulationSettings::load();
+            combo_select(ff, FF_SPEEDS.iter().position(|&(_, v)| v == emu.ff_speed).unwrap_or(3) as i32);
+
+            create_label(hwnd, "Rewind Buffer:", ox, oy + 30, 160, 22);
+            let rw = create_combo(
+                hwnd, ID_REWIND_BUF,
+                &REWIND_SIZES.iter().map(|&(n, _)| n).collect::<Vec<_>>(),
+                ox + 170, oy + 30, 180, 200,
+            );
+            combo_select(rw, REWIND_SIZES.iter().position(|&(_, v)| v == emu.rewind_buffer_seconds).unwrap_or(1) as i32);
+
+            create_label(hwnd, "Boot ROM:", ox, oy + 60, 160, 22);
+            let br = create_combo(
+                hwnd, ID_BOOT_ROM, &["CGB (Color)", "DMG (Original)"],
+                ox + 170, oy + 60, 180, 200,
+            );
+            combo_select(br, if emu.boot_rom == "dmg" { 1 } else { 0 });
+
+            create_button(hwnd, ID_SAVE_EMU, "Save", 390, 380, 90, 30);
+            create_button(hwnd, ID_DEFAULTS_EMU, "Defaults", 290, 380, 90, 30);
+
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = UpdateWindow(hwnd);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Qt backend — used on Linux, or any platform with `--features qt`
+// ---------------------------------------------------------------------------
+
+#[cfg(any(target_os = "linux", feature = "qt"))]
+mod platform {
+    use std::sync::Mutex;
+
+    use crate::settings::{
+        Action, ControlsSettings, DisplaySettings, EmulationSettings, WindowMode,
+    };
+
+    pub static SETTINGS_SENDER: Mutex<
+        Option<std::sync::mpsc::SyncSender<super::SettingsChanged>>,
+    > = Mutex::new(None);
+
+    fn notify(kind: super::SettingsChanged) {
+        if let Some(ref tx) = *SETTINGS_SENDER.lock().unwrap() {
+            let _ = tx.try_send(kind);
+        }
+    }
+
+    pub fn open_preferences_window() {
+        let emu = EmulationSettings::load();
+        let display = DisplaySettings::load();
+        let controls = ControlsSettings::load();
+
+        // Build key_bindings string: "key_up=up;key_down=down;..."
+        let bindings_str: String = Action::ALL
+            .iter()
+            .filter_map(|&action| {
+                let key = controls.key_for(action);
+                if key.is_empty() {
+                    None
+                } else {
+                    Some(format!("{}={}", action.config_key(), key))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(";");
+
+        let boot_rom_c = std::ffi::CString::new(emu.boot_rom.as_str()).unwrap_or_default();
+        let bindings_c = std::ffi::CString::new(bindings_str.as_str()).unwrap_or_default();
+
+        let mode_idx = WindowMode::ALL
+            .iter()
+            .position(|&m| m == display.window_mode)
+            .unwrap_or(0);
+
+        unsafe {
+            crate::qt_ffi::qt_open_preferences(
+                emu.ff_speed,
+                emu.rewind_buffer_seconds as i32,
+                boot_rom_c.as_ptr(),
+                display.window_scale as i32,
+                mode_idx as i32,
+                if display.vsync { 1 } else { 0 },
+                display.frame_limit as i32,
+                bindings_c.as_ptr(),
+            );
+        }
+
+        // Start a polling thread for preferences save notifications.
+        // The Qt action codes -1, -2, -3 correspond to settings changes.
+        // The main Qt event pump in menu.rs handles these too, but we
+        // also need to read back widget values and save them.
+        std::thread::Builder::new()
+            .name("qt-prefs-poll".to_owned())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+
+                    let code = unsafe { crate::qt_ffi::qt_poll_action() };
+                    match code {
+                        -1 => {
+                            // Save emulation settings from Qt widgets.
+                            let settings = unsafe {
+                                EmulationSettings {
+                                    ff_speed: crate::qt_ffi::qt_prefs_ff_speed(),
+                                    rewind_buffer_seconds: crate::qt_ffi::qt_prefs_rewind_secs() as u32,
+                                    boot_rom: if crate::qt_ffi::qt_prefs_boot_rom_is_dmg() != 0 {
+                                        "dmg".to_owned()
+                                    } else {
+                                        "cgb".to_owned()
+                                    },
+                                }
+                            };
+                            settings.save();
+                            notify(super::SettingsChanged::Emulation);
+                            eprintln!("Emulation settings saved (Qt)");
+                        }
+                        -2 => {
+                            let settings = unsafe {
+                                DisplaySettings {
+                                    window_scale: crate::qt_ffi::qt_prefs_scale() as u32,
+                                    window_mode: WindowMode::ALL
+                                        .get(crate::qt_ffi::qt_prefs_window_mode() as usize)
+                                        .copied()
+                                        .unwrap_or(WindowMode::Windowed),
+                                    vsync: crate::qt_ffi::qt_prefs_vsync() != 0,
+                                    frame_limit: crate::qt_ffi::qt_prefs_frame_limit() as u32,
+                                }
+                            };
+                            settings.save();
+                            notify(super::SettingsChanged::Display);
+                            eprintln!("Display settings saved (Qt)");
+                        }
+                        -3 => {
+                            let bindings_ptr = unsafe { crate::qt_ffi::qt_prefs_key_bindings() };
+                            if !bindings_ptr.is_null() {
+                                let bindings_str = unsafe {
+                                    std::ffi::CStr::from_ptr(bindings_ptr)
+                                        .to_string_lossy()
+                                        .into_owned()
+                                };
+                                unsafe { crate::qt_ffi::qt_free_string(bindings_ptr) };
+
+                                let mut settings = ControlsSettings::load();
+                                for pair in bindings_str.split(';') {
+                                    let mut kv = pair.splitn(2, '=');
+                                    if let (Some(config_key), Some(value)) = (kv.next(), kv.next()) {
+                                        // Find matching action by config_key.
+                                        for &action in &Action::ALL {
+                                            if action.config_key() == config_key {
+                                                settings.bindings.insert(action, value.to_owned());
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                settings.save();
+                                notify(super::SettingsChanged::Controls);
+                                eprintln!("Controls settings saved (Qt)");
+                            }
+                        }
+                        0 => {} // no action
+                        _ => {} // handled by menu event pump
+                    }
+                }
+            })
+            .ok();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fallback
+// ---------------------------------------------------------------------------
+
+#[cfg(not(any(
+    all(target_os = "macos", not(feature = "qt")),
+    target_os = "windows",
+    target_os = "linux",
+    feature = "qt",
+)))]
 mod platform {
     pub fn open_preferences_window() {
-        eprintln!("Preferences window not available on this platform yet");
+        eprintln!("Preferences window not available on this platform");
     }
 }
 

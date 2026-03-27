@@ -2,6 +2,11 @@
 name = "chudtendo"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
+
+[features]
+default = []
+qt = []
 
 [dependencies]
 rand = "0.8"
@@ -13,10 +18,23 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 bincode = "1"
 rfd = "0.15"
+cc = { version = "1", optional = true }
+
+[build-dependencies]
+cc = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 cocoa = "0.26"
 objc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Gdi",
+] }
 
 [dev-dependencies]
 png = "0.17"
