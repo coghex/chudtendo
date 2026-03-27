@@ -6,6 +6,8 @@ pub mod app;
 pub mod emulator;
 pub mod input;
 pub mod menu;
+pub mod preferences;
+pub mod settings;
 pub mod shader;
 
 pub use app::{RunMode, run, run_with_agent};

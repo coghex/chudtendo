@@ -9,11 +9,10 @@ use sdl2::render::Texture;
 use sdl2::video::Window;
 
 use crate::emulator::{CartridgeMetadata, Emulator, SCREEN_HEIGHT, SCREEN_WIDTH, Snapshot};
-use crate::input::Keybindings;
 use crate::menu::{self, MenuAction};
 use crate::shader::Shader;
 
-const WINDOW_SCALE: u32 = 4;
+const DEFAULT_WINDOW_SCALE: u32 = 4;
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
 const DEFAULT_PPU_DELAY: Duration = Duration::from_nanos(16_536_000);
 const HALF_REFRESH_MATCH_TOLERANCE: Duration = Duration::from_micros(2_000);
@@ -53,10 +52,12 @@ fn run_inner(
         .video()
         .map_err(|error| format!("failed to initialize SDL video: {error}"))?;
 
+    let mut current_scale = load_window_scale();
+
     let mut window_builder = video.window(
         "Chudtendo",
-        SCREEN_WIDTH as u32 * WINDOW_SCALE,
-        SCREEN_HEIGHT as u32 * WINDOW_SCALE,
+        SCREEN_WIDTH as u32 * current_scale,
+        SCREEN_HEIGHT as u32 * current_scale,
     );
     window_builder.position_centered();
 
@@ -83,7 +84,7 @@ fn run_inner(
     };
 
     canvas
-        .set_scale(WINDOW_SCALE as f32, WINDOW_SCALE as f32)
+        .set_scale(current_scale as f32, current_scale as f32)
         .map_err(|error| format!("failed to configure render scale: {error}"))?;
 
     let texture_creator = canvas.texture_creator();
@@ -142,7 +143,11 @@ fn run_inner(
             })
             .collect()
     });
-    let menu_receiver = menu::install_menu_bar(slot_info_fn);
+    let shared_scale: menu::SharedScale = std::sync::Arc::new(
+        std::sync::atomic::AtomicU32::new(current_scale),
+    );
+    let menu_receiver = menu::install_menu_bar(slot_info_fn, shared_scale.clone());
+    let settings_receiver = crate::preferences::install_settings_channel();
 
     // SDL video should stay on the main thread on macOS, so the emulator modules run in workers.
     emulator.start()?;
@@ -163,7 +168,8 @@ fn run_inner(
     });
 
     let shader = load_shader();
-    let keybindings = Keybindings::load_or_default(Path::new("keybindings.yaml"));
+    let controls = crate::settings::ControlsSettings::load();
+    let mut input_map = crate::settings::InputMap::from_controls(&controls);
     let mut joypad = emulator.joypad().clone();
     let initial_snapshot = wait_for_live_snapshot(&mut emulator, Duration::from_millis(100));
     upload_framebuffer(&mut texture, &initial_snapshot.framebuffer, &shader)?;
@@ -174,7 +180,7 @@ fn run_inner(
         .map_err(|error| format!("failed to create SDL event pump: {error}"))?;
     let mut fast_forward_toggled = false;
     let mut fast_forward_held = false;
-    let ff_speed: f32 = 0.0; // uncapped
+    let mut ff_speed: f32 = crate::settings::EmulationSettings::load().ff_speed;
 
     let mut rewinding = false;
     let mut last_rewind_step = Instant::now();
@@ -263,6 +269,62 @@ fn run_inner(
                         eprintln!("Rewind stopped");
                     }
                 }
+                MenuAction::OpenSettings => {
+                    crate::preferences::open_preferences_window();
+                }
+                MenuAction::SetScale(new_scale) => {
+                    if new_scale >= 1 && new_scale <= 8 {
+                        current_scale = new_scale;
+                        shared_scale.store(current_scale, std::sync::atomic::Ordering::Relaxed);
+                        canvas
+                            .window_mut()
+                            .set_size(
+                                SCREEN_WIDTH as u32 * current_scale,
+                                SCREEN_HEIGHT as u32 * current_scale,
+                            )
+                            .map_err(|e| format!("failed to resize window: {e}"))?;
+                        canvas
+                            .set_scale(current_scale as f32, current_scale as f32)
+                            .map_err(|e| format!("failed to set render scale: {e}"))?;
+                        save_window_scale(current_scale);
+                        eprintln!("Scale: {current_scale}x");
+                    }
+                }
+            }
+        }
+
+        // Poll for settings changes from preferences window.
+        while let Ok(changed) = settings_receiver.try_recv() {
+            use crate::preferences::SettingsChanged;
+            match changed {
+                SettingsChanged::Emulation => {
+                    let emu_settings = crate::settings::EmulationSettings::load();
+                    ff_speed = emu_settings.ff_speed;
+                    // Apply current FF state with new speed.
+                    apply_ff_speed(&emulator, fast_forward_toggled || fast_forward_held, speed, ff_speed);
+                    eprintln!("Emulation settings applied (ff_speed={ff_speed})");
+                }
+                SettingsChanged::Display => {
+                    let display_settings = crate::settings::DisplaySettings::load();
+                    if display_settings.window_scale != current_scale
+                        && display_settings.window_scale >= 1
+                        && display_settings.window_scale <= 8
+                    {
+                        current_scale = display_settings.window_scale;
+                        shared_scale.store(current_scale, std::sync::atomic::Ordering::Relaxed);
+                        let _ = canvas.window_mut().set_size(
+                            SCREEN_WIDTH as u32 * current_scale,
+                            SCREEN_HEIGHT as u32 * current_scale,
+                        );
+                        let _ = canvas.set_scale(current_scale as f32, current_scale as f32);
+                        eprintln!("Display settings applied (scale={current_scale}x)");
+                    }
+                }
+                SettingsChanged::Controls => {
+                    let controls = crate::settings::ControlsSettings::load();
+                    input_map = crate::settings::InputMap::from_controls(&controls);
+                    eprintln!("Controls settings applied");
+                }
             }
         }
 
@@ -305,51 +367,79 @@ fn run_inner(
                                 Err(e) => eprintln!("Save failed: {e}"),
                             }
                         }
-                    } else if keycode == Keycode::F9 {
-                        let now_paused = emulator.toggle_pause();
-                        eprintln!("{}", if now_paused { "Paused" } else { "Resumed" });
-                    } else if keycode == Keycode::F10 {
-                        match emulator.reset() {
-                            Ok(()) => {
-                                _audio_device = init_audio(&sdl, &mut emulator)?;
-                                joypad = emulator.joypad().clone();
-                                emulator.rewind_clear();
-                                last_rewind_capture_frame = 0;
-                                eprintln!("Reset");
+                    } else if let Some(action) = input_map.lookup(&sdl_key_name(keycode)) {
+                        use crate::settings::Action;
+                        match action {
+                            Action::Pause => {
+                                let now_paused = emulator.toggle_pause();
+                                eprintln!("{}", if now_paused { "Paused" } else { "Resumed" });
                             }
-                            Err(e) => eprintln!("Reset failed: {e}"),
+                            Action::Reset => {
+                                match emulator.reset() {
+                                    Ok(()) => {
+                                        _audio_device = init_audio(&sdl, &mut emulator)?;
+                                        joypad = emulator.joypad().clone();
+                                        emulator.rewind_clear();
+                                        last_rewind_capture_frame = 0;
+                                        eprintln!("Reset");
+                                    }
+                                    Err(e) => eprintln!("Reset failed: {e}"),
+                                }
+                            }
+                            Action::FastForwardToggle => {
+                                fast_forward_toggled = !fast_forward_toggled;
+                                apply_ff_speed(&emulator, fast_forward_toggled || fast_forward_held, speed, ff_speed);
+                                eprintln!("Fast forward {}", if fast_forward_toggled { "ON" } else { "OFF" });
+                            }
+                            Action::FastForwardHold => {
+                                fast_forward_held = true;
+                                apply_ff_speed(&emulator, fast_forward_toggled || fast_forward_held, speed, ff_speed);
+                            }
+                            Action::Rewind => {
+                                if !rewinding {
+                                    rewinding = true;
+                                    emulator.pause();
+                                    last_rewind_step = Instant::now();
+                                }
+                            }
+                            Action::Up => joypad.press(crate::input::JoypadButton::Up),
+                            Action::Down => joypad.press(crate::input::JoypadButton::Down),
+                            Action::Left => joypad.press(crate::input::JoypadButton::Left),
+                            Action::Right => joypad.press(crate::input::JoypadButton::Right),
+                            Action::A => joypad.press(crate::input::JoypadButton::A),
+                            Action::B => joypad.press(crate::input::JoypadButton::B),
+                            Action::Start => joypad.press(crate::input::JoypadButton::Start),
+                            Action::Select => joypad.press(crate::input::JoypadButton::Select),
                         }
-                    } else if keycode == Keycode::F11 {
-                        fast_forward_toggled = !fast_forward_toggled;
-                        apply_ff_speed(&emulator, fast_forward_toggled || fast_forward_held, speed, ff_speed);
-                        eprintln!("Fast forward {}", if fast_forward_toggled { "ON" } else { "OFF" });
-                    } else if keycode == Keycode::Backquote {
-                        if !rewinding {
-                            rewinding = true;
-                            emulator.pause();
-                            last_rewind_step = Instant::now();
-                        }
-                    } else if keycode == Keycode::Tab {
-                        fast_forward_held = true;
-                        apply_ff_speed(&emulator, fast_forward_toggled || fast_forward_held, speed, ff_speed);
-                    } else if let Some(button) = keybindings.lookup(&sdl_key_name(keycode)) {
-                        joypad.press(button);
                     }
                 }
                 Event::KeyUp {
                     keycode: Some(keycode),
                     ..
                 } => {
-                    if keycode == Keycode::Backquote {
-                        if rewinding {
-                            rewinding = false;
-                            emulator.resume();
+                    if let Some(action) = input_map.lookup(&sdl_key_name(keycode)) {
+                        use crate::settings::Action;
+                        match action {
+                            Action::Rewind => {
+                                if rewinding {
+                                    rewinding = false;
+                                    emulator.resume();
+                                }
+                            }
+                            Action::FastForwardHold => {
+                                fast_forward_held = false;
+                                apply_ff_speed(&emulator, fast_forward_toggled || fast_forward_held, speed, ff_speed);
+                            }
+                            Action::Up => joypad.release(crate::input::JoypadButton::Up),
+                            Action::Down => joypad.release(crate::input::JoypadButton::Down),
+                            Action::Left => joypad.release(crate::input::JoypadButton::Left),
+                            Action::Right => joypad.release(crate::input::JoypadButton::Right),
+                            Action::A => joypad.release(crate::input::JoypadButton::A),
+                            Action::B => joypad.release(crate::input::JoypadButton::B),
+                            Action::Start => joypad.release(crate::input::JoypadButton::Start),
+                            Action::Select => joypad.release(crate::input::JoypadButton::Select),
+                            _ => {} // toggle actions don't need key-up handling
                         }
-                    } else if keycode == Keycode::Tab {
-                        fast_forward_held = false;
-                        apply_ff_speed(&emulator, fast_forward_toggled || fast_forward_held, speed, ff_speed);
-                    } else if let Some(button) = keybindings.lookup(&sdl_key_name(keycode)) {
-                        joypad.release(button);
                     }
                 }
                 _ => {}
@@ -602,19 +692,18 @@ fn upload_framebuffer(texture: &mut Texture<'_>, framebuffer: &[u8], shader: &Sh
         .map_err(|error| format!("failed to upload framebuffer: {error}"))
 }
 
-fn load_shader() -> Shader {
-    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.yaml");
-    let shader_path = std::fs::read_to_string(&config_path)
-        .ok()
-        .and_then(|contents| {
-            let config: std::collections::HashMap<String, String> =
-                serde_yaml::from_str(&contents).ok()?;
-            config.get("shader").map(|s| {
-                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(s)
-            })
-        });
+fn load_window_scale() -> u32 {
+    crate::settings::DisplaySettings::load().window_scale
+}
 
-    match shader_path {
+fn save_window_scale(scale: u32) {
+    let mut ds = crate::settings::DisplaySettings::load();
+    ds.window_scale = scale;
+    ds.save();
+}
+
+fn load_shader() -> Shader {
+    match crate::settings::shader_path() {
         Some(path) => match Shader::load(&path) {
             Ok(shader) => {
                 eprintln!("Shader loaded: {} ({})", shader.name, path.display());

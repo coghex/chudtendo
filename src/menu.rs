@@ -8,6 +8,8 @@ pub enum MenuAction {
     LoadState(u8),
     ToggleFastForward,
     ToggleRewind,
+    SetScale(u32),
+    OpenSettings,
 }
 
 /// Description of a single save-state slot, used to populate menu labels.
@@ -20,6 +22,9 @@ pub struct SlotInfo {
 /// Callback the menu system uses to query current slot status right before
 /// the submenu opens.  The app supplies this; the menu module calls it.
 pub type SlotInfoFn = Box<dyn Fn() -> Vec<SlotInfo> + Send>;
+
+/// Shared current window scale so the menu can show a checkmark.
+pub type SharedScale = std::sync::Arc<std::sync::atomic::AtomicU32>;
 
 #[cfg(target_os = "macos")]
 mod platform {
@@ -46,6 +51,12 @@ mod platform {
     static SLOT_INFO_FN: Mutex<Option<SlotInfoFn>> = Mutex::new(None);
     // Store references to save/load menu items so we can update their titles.
     // Only accessed from the main (AppKit) thread.
+    static SHARED_SCALE: Mutex<Option<super::SharedScale>> = Mutex::new(None);
+    static SCALE_ITEMS: Mutex<[SendId; 8]> = Mutex::new([
+        SendId(0 as id), SendId(0 as id), SendId(0 as id), SendId(0 as id),
+        SendId(0 as id), SendId(0 as id), SendId(0 as id), SendId(0 as id),
+    ]);
+
     static SAVE_ITEMS: Mutex<[SendId; 8]> = Mutex::new([
         SendId(0 as id), SendId(0 as id), SendId(0 as id), SendId(0 as id),
         SendId(0 as id), SendId(0 as id), SendId(0 as id), SendId(0 as id),
@@ -86,6 +97,36 @@ mod platform {
     extern "C" fn action_rewind(_this: &Object, _sel: Sel, _sender: id) {
         send_action(MenuAction::ToggleRewind);
     }
+
+    extern "C" fn action_open_settings(_this: &Object, _sel: Sel, _sender: id) {
+        send_action(MenuAction::OpenSettings);
+    }
+
+    macro_rules! scale_handler {
+        ($name:ident, $scale:expr) => {
+            extern "C" fn $name(_this: &Object, _sel: Sel, _sender: id) {
+                send_action(MenuAction::SetScale($scale));
+            }
+        };
+    }
+
+    scale_handler!(action_scale_1, 1);
+    scale_handler!(action_scale_2, 2);
+    scale_handler!(action_scale_3, 3);
+    scale_handler!(action_scale_4, 4);
+    scale_handler!(action_scale_5, 5);
+    scale_handler!(action_scale_6, 6);
+    scale_handler!(action_scale_7, 7);
+    scale_handler!(action_scale_8, 8);
+
+    const SCALE_HANDLERS: [extern "C" fn(&Object, Sel, id); 8] = [
+        action_scale_1, action_scale_2, action_scale_3, action_scale_4,
+        action_scale_5, action_scale_6, action_scale_7, action_scale_8,
+    ];
+    const SCALE_SELECTORS: [&str; 8] = [
+        "setScale1:", "setScale2:", "setScale3:", "setScale4:",
+        "setScale5:", "setScale6:", "setScale7:", "setScale8:",
+    ];
 
     macro_rules! save_slot_handler {
         ($name:ident, $slot:expr) => {
@@ -148,12 +189,34 @@ mod platform {
     /// Called by AppKit when a submenu is about to open — refresh slot labels.
     extern "C" fn menu_needs_update(_this: &Object, _sel: Sel, menu: id) {
         unsafe {
-            let title: id = msg_send![menu, title];
-            let title_len: usize = msg_send![title, length];
-            if title_len == 0 {
+            let count: i64 = msg_send![menu, numberOfItems];
+            if count == 0 {
+                return;
+            }
+            let first_item: id = msg_send![menu, itemAtIndex: 0i64];
+            let first_action: Sel = msg_send![first_item, action];
+
+            // --- Scale submenu: update checkmarks ---
+            if first_action == selector("setScale1:") {
+                let current = SHARED_SCALE
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|s| s.load(std::sync::atomic::Ordering::Relaxed))
+                    .unwrap_or(4);
+                let items = SCALE_ITEMS.lock().unwrap();
+                for i in 0..8 {
+                    let item = items[i].0;
+                    if item != nil {
+                        let on: bool = (i + 1) as u32 == current;
+                        let state: i64 = if on { 1 } else { 0 }; // NSOnState=1, NSOffState=0
+                        let () = msg_send![item, setState: state];
+                    }
+                }
                 return;
             }
 
+            // --- Save / Load State submenus: update timestamps ---
             let infos = {
                 let guard = SLOT_INFO_FN.lock().unwrap();
                 match &*guard {
@@ -162,14 +225,6 @@ mod platform {
                 }
             };
 
-            // Figure out if this is the save or load submenu by checking
-            // the first item's action selector.
-            let count: i64 = msg_send![menu, numberOfItems];
-            if count == 0 {
-                return;
-            }
-            let first_item: id = msg_send![menu, itemAtIndex: 0i64];
-            let first_action: Sel = msg_send![first_item, action];
             let is_save = first_action == selector("saveSlot1:");
 
             let items_guard;
@@ -230,6 +285,17 @@ mod platform {
                 selector("toggleRewind:"),
                 action_rewind as extern "C" fn(&Object, Sel, id),
             );
+            decl.add_method(
+                selector("openSettings:"),
+                action_open_settings as extern "C" fn(&Object, Sel, id),
+            );
+
+            for i in 0..8 {
+                decl.add_method(
+                    selector(SCALE_SELECTORS[i]),
+                    SCALE_HANDLERS[i] as extern "C" fn(&Object, Sel, id),
+                );
+            }
 
             for i in 0..8 {
                 decl.add_method(
@@ -311,12 +377,16 @@ mod platform {
         menu
     }
 
-    pub fn install_menu_bar(slot_info_fn: SlotInfoFn) -> mpsc::Receiver<MenuAction> {
+    pub fn install_menu_bar(
+        slot_info_fn: SlotInfoFn,
+        shared_scale: super::SharedScale,
+    ) -> mpsc::Receiver<MenuAction> {
         let (sender, receiver) = mpsc::sync_channel(16);
 
         unsafe {
             *MENU_SENDER.lock().unwrap() = Some(sender);
             *SLOT_INFO_FN.lock().unwrap() = Some(slot_info_fn);
+            *SHARED_SCALE.lock().unwrap() = Some(shared_scale);
 
             let _pool = NSAutoreleasePool::new(nil);
             let app = NSApp();
@@ -420,19 +490,70 @@ mod platform {
             let emu_bar_item = NSMenuItem::new(nil).autorelease();
             emu_bar_item.setSubmenu_(emu_menu);
 
+            // --- View menu ---
+            let view_menu = NSMenu::new(nil).autorelease();
+            let () = msg_send![view_menu, setTitle: NSString::alloc(nil).init_str("View")];
+
+            // Scale submenu
+            let scale_submenu = NSMenu::new(nil).autorelease();
+            let () = msg_send![scale_submenu, setTitle: NSString::alloc(nil).init_str("Scale")];
+            let () = msg_send![scale_submenu, setDelegate: delegate];
+
+            for i in 0..8 {
+                let label = format!("{}x", i + 1);
+                let key = format!("{}", i + 1);
+                let item = make_menu_item(
+                    &label,
+                    selector(SCALE_SELECTORS[i]),
+                    &key,
+                    NSEventModifierFlags::NSCommandKeyMask,
+                    delegate,
+                );
+                scale_submenu.addItem_(item);
+                SCALE_ITEMS.lock().unwrap()[i] = SendId(item);
+            }
+
+            let scale_bar_item = NSMenuItem::new(nil).autorelease();
+            let () = msg_send![scale_bar_item, setTitle: NSString::alloc(nil).init_str("Scale")];
+            scale_bar_item.setSubmenu_(scale_submenu);
+            view_menu.addItem_(scale_bar_item);
+
+            let view_bar_item = NSMenuItem::new(nil).autorelease();
+            view_bar_item.setSubmenu_(view_menu);
+
             // Get the existing menu bar (SDL2 creates one) and append our menus.
             let main_menu: id = msg_send![app, mainMenu];
             if main_menu != nil {
-                // Insert File after the app menu (index 1), Emulation after that.
                 let count: i64 = msg_send![main_menu, numberOfItems];
                 let insert_idx = if count > 0 { 1 } else { 0 };
                 let () = msg_send![main_menu, insertItem: file_bar_item atIndex: insert_idx];
                 let () = msg_send![main_menu, insertItem: emu_bar_item atIndex: insert_idx + 1];
+                let () = msg_send![main_menu, insertItem: view_bar_item atIndex: insert_idx + 2];
             } else {
                 let menu_bar = NSMenu::new(nil).autorelease();
                 menu_bar.addItem_(file_bar_item);
                 menu_bar.addItem_(emu_bar_item);
+                menu_bar.addItem_(view_bar_item);
                 app.setMainMenu_(menu_bar);
+            }
+
+            // Add "Settings..." to the app menu (first menu item SDL2 creates).
+            let main_menu: id = msg_send![app, mainMenu];
+            if main_menu != nil {
+                let app_menu_item: id = msg_send![main_menu, itemAtIndex: 0i64];
+                let app_submenu: id = msg_send![app_menu_item, submenu];
+                if app_submenu != nil {
+                    let separator = NSMenuItem::separatorItem(nil);
+                    let () = msg_send![app_submenu, insertItem: separator atIndex: 1i64];
+                    let settings_item = make_menu_item(
+                        "Settings\u{2026}",
+                        selector("openSettings:"),
+                        ",",
+                        NSEventModifierFlags::NSCommandKeyMask,
+                        delegate,
+                    );
+                    let () = msg_send![app_submenu, insertItem: settings_item atIndex: 2i64];
+                }
             }
 
             // Prevent the delegate from being deallocated.
@@ -448,7 +569,7 @@ mod platform {
     use super::{MenuAction, SlotInfoFn};
     use std::sync::mpsc;
 
-    pub fn install_menu_bar(_slot_info_fn: SlotInfoFn) -> mpsc::Receiver<MenuAction> {
+    pub fn install_menu_bar(_slot_info_fn: SlotInfoFn, _shared_scale: super::SharedScale) -> mpsc::Receiver<MenuAction> {
         let (_sender, receiver) = mpsc::sync_channel(16);
         // No native menu bar on this platform yet (Phase 6).
         receiver
