@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use super::bus::Bus;
 use super::component::{
     Command, ComponentReport, InterruptFlags, MasterClock, MemoryCommand, ReadResult,
-    TimerInitState, TimerReport, WriteResult,
+    SharedTimerState, TimerInitState, TimerReport, WriteResult,
 };
 
 #[derive(Serialize, Deserialize)]
@@ -29,6 +29,7 @@ const TIMER_REPORT_INTERVAL: u64 = 1024;
 pub struct TimerThread {
     interrupt_flags: InterruptFlags,
     clock: MasterClock,
+    shared: SharedTimerState,
     div: u8,
     tima: u8,
     tma: u8,
@@ -47,11 +48,12 @@ impl TimerThread {
         interrupt_flags: InterruptFlags,
         reports: Sender<ComponentReport>,
         clock: MasterClock,
+        shared: SharedTimerState,
     ) -> thread::JoinHandle<()> {
         thread::Builder::new()
             .name("timer".to_owned())
             .spawn(move || {
-                Self::from_init_state(init_state, bus, interrupt_flags, clock.clone())
+                Self::from_init_state(init_state, bus, interrupt_flags, clock.clone(), shared)
                     .run(inbox, reports, clock)
             })
             .expect("failed to spawn timer thread")
@@ -72,6 +74,7 @@ impl TimerThread {
             if self.cycles < target {
                 self.step();
                 self.cycles += TIMER_CLOCKS_PER_SAMPLE as u64;
+                self.publish_shared();
 
                 if self.ticks == 1 || self.ticks % TIMER_REPORT_INTERVAL == 0 {
                     let _ =
@@ -89,6 +92,7 @@ impl TimerThread {
             self.step();
             self.cycles += TIMER_CLOCKS_PER_SAMPLE as u64;
         }
+        self.publish_shared();
     }
 
     fn service_inbox(&mut self, inbox: &Receiver<Command>) -> bool {
@@ -135,6 +139,7 @@ impl TimerThread {
         self.cycles = state.cycles;
         self.system_counter = state.system_counter;
         self.pending_reload = state.pending_reload;
+        self.publish_shared();
     }
 
     fn handle_memory(&mut self, command: MemoryCommand) {
@@ -179,6 +184,7 @@ impl TimerThread {
                     }
                     _ => WriteResult::NoData,
                 };
+                self.publish_shared();
                 if let Some(respond_to) = respond_to {
                     let _ = respond_to.send(result);
                 }
@@ -191,14 +197,20 @@ impl TimerThread {
         _bus: Bus,
         interrupt_flags: InterruptFlags,
         clock: MasterClock,
+        shared: SharedTimerState,
     ) -> Self {
+        let tac = init_state.tac & 0x07;
+        let tima = init_state.tima;
+        let tma = init_state.tma;
+        shared.publish(0, tima, tma, tac, 0);
         Self {
             interrupt_flags,
             clock,
+            shared,
             div: 0,
-            tima: init_state.tima,
-            tma: init_state.tma,
-            tac: init_state.tac & 0x07,
+            tima,
+            tma,
+            tac,
             ticks: 0,
             cycles: 0,
             system_counter: 0,
@@ -217,6 +229,10 @@ impl TimerThread {
             self.tima = self.tma;
             self.interrupt_flags.set(TIMER_INTERRUPT_MASK);
         }
+    }
+
+    fn publish_shared(&self) {
+        self.shared.publish(self.div, self.tima, self.tma, self.tac, self.cycles);
     }
 
     fn apply_counter_change(&mut self, next_counter: u16, next_tac: u8) {

@@ -98,10 +98,8 @@ pub struct PpuThread {
     interrupt_flags: InterruptFlags,
     dots: u64,
     hardware_mode: HardwareMode,
-    vram_banks: Vec<Vec<u8>>,
+    shared: super::component::SharedPpuState,
     selected_vram_bank: u8,
-    oam: [u8; OAM_SIZE],
-    lcd_registers: [u8; LCD_REGISTERS_LEN],
     hdma_registers: [u8; HDMA_REGISTERS_LEN],
     bg_palette_index: u8,
     obj_palette_index: u8,
@@ -125,9 +123,30 @@ pub struct PpuThread {
     hdma: Option<HdmaTransfer>,
     scanline_registers: [ScanlineRegisters; SCREEN_HEIGHT],
     window_line: u8,
-    rendering_vram: Vec<Vec<u8>>,
-    rendering_oam: [u8; OAM_SIZE],
     progress: super::component::PpuProgress,
+}
+
+// Convenience accessors that route through the shared state.
+// These replace the old owned `vram_banks`, `oam`, and `lcd_registers` fields.
+impl PpuThread {
+    fn vram_read(&self, bank: usize, offset: usize) -> u8 {
+        self.shared.vram_bank_slice(bank)[offset]
+    }
+    fn vram_write(&self, bank: usize, offset: usize, value: u8) {
+        self.shared.vram_bank_slice_mut(bank)[offset] = value;
+    }
+    fn oam_read(&self, offset: usize) -> u8 {
+        self.shared.oam_slice()[offset]
+    }
+    fn oam_write(&self, offset: usize, value: u8) {
+        self.shared.oam_mut_slice()[offset] = value;
+    }
+    fn lcd_reg(&self, index: usize) -> u8 {
+        self.shared.lcd_reg_read(index)
+    }
+    fn set_lcd_reg(&self, index: usize, value: u8) {
+        self.shared.lcd_reg_write(index, value);
+    }
 }
 
 #[derive(Debug)]
@@ -174,6 +193,7 @@ impl PpuThread {
         frame_ready: SyncSender<PublishedFrame>,
         frame_recycle: Receiver<Vec<u8>>,
         clock: MasterClock,
+        shared: super::component::SharedPpuState,
     ) -> (thread::JoinHandle<()>, super::component::PpuProgress) {
         let progress = super::component::PpuProgress::new();
         let progress_clone = progress.clone();
@@ -187,6 +207,7 @@ impl PpuThread {
                     clock.clone(),
                     frame_ready,
                     frame_recycle,
+                    shared,
                 );
                 ppu.progress = progress_clone;
                 ppu.run(inbox, reports, clock)
@@ -226,6 +247,7 @@ impl PpuThread {
                 Ok(Command::Memory(command)) => self.handle_memory(command),
                 Ok(Command::SetHardwareMode(hardware_mode)) => {
                     self.hardware_mode = hardware_mode;
+                    self.shared.set_hardware_mode(hardware_mode);
                     self.framebuffer_dirty = true;
                     self.report_framebuffer_pending = true;
                     self.report_dirty = true;
@@ -241,15 +263,17 @@ impl PpuThread {
                     }
                 }
                 Ok(Command::RequestPpuFeatures(respond_to)) => {
+                    let mut oam_copy = [0u8; 160];
+                    oam_copy.copy_from_slice(&self.shared.oam_slice()[..160]);
                     let features = super::component::PpuFeatures {
-                        oam: self.oam,
-                        lcdc: self.lcd_registers[LCDC_INDEX],
-                        stat: self.lcd_registers[STAT_INDEX],
-                        scy: self.lcd_registers[SCY_INDEX],
-                        scx: self.lcd_registers[SCX_INDEX],
-                        ly: self.lcd_registers[LY_INDEX],
-                        wy: self.lcd_registers[WY_INDEX],
-                        wx: self.lcd_registers[WX_INDEX],
+                        oam: oam_copy,
+                        lcdc: self.lcd_reg(LCDC_INDEX),
+                        stat: self.lcd_reg(STAT_INDEX),
+                        scy: self.lcd_reg(SCY_INDEX),
+                        scx: self.lcd_reg(SCX_INDEX),
+                        ly: self.lcd_reg(LY_INDEX),
+                        wy: self.lcd_reg(WY_INDEX),
+                        wx: self.lcd_reg(WX_INDEX),
                     };
                     let _ = respond_to.send(features);
                 }
@@ -262,10 +286,10 @@ impl PpuThread {
 
     fn create_save_state(&self) -> PpuSaveState {
         PpuSaveState {
-            vram_banks: self.vram_banks.clone(),
+            vram_banks: (0..VRAM_BANKS).map(|b| self.shared.vram_bank_slice(b).to_vec()).collect(),
             selected_vram_bank: self.selected_vram_bank,
-            oam: self.oam.to_vec(),
-            lcd_registers: self.lcd_registers.to_vec(),
+            oam: self.shared.oam_slice().to_vec(),
+            lcd_registers: (0..LCD_REGISTERS_LEN).map(|i| self.lcd_reg(i)).collect(),
             hdma_registers: self.hdma_registers.to_vec(),
             bg_palette_index: self.bg_palette_index,
             obj_palette_index: self.obj_palette_index,
@@ -282,20 +306,38 @@ impl PpuThread {
     }
 
     fn apply_save_state(&mut self, state: PpuSaveState) {
-        self.vram_banks = state.vram_banks;
+        for (bank_idx, bank_data) in state.vram_banks.iter().enumerate() {
+            if bank_idx < VRAM_BANKS {
+                let dest = self.shared.vram_bank_slice_mut(bank_idx);
+                let len = bank_data.len().min(VRAM_BANK_SIZE);
+                dest[..len].copy_from_slice(&bank_data[..len]);
+            }
+        }
         self.selected_vram_bank = state.selected_vram_bank;
+        self.shared.set_selected_vram_bank(state.selected_vram_bank);
         let len = state.oam.len().min(OAM_SIZE);
-        self.oam[..len].copy_from_slice(&state.oam[..len]);
+        self.shared.oam_mut_slice()[..len].copy_from_slice(&state.oam[..len]);
         let len = state.lcd_registers.len().min(LCD_REGISTERS_LEN);
-        self.lcd_registers[..len].copy_from_slice(&state.lcd_registers[..len]);
+        for i in 0..len {
+            self.set_lcd_reg(i, state.lcd_registers[i]);
+        }
         let len = state.hdma_registers.len().min(HDMA_REGISTERS_LEN);
         self.hdma_registers[..len].copy_from_slice(&state.hdma_registers[..len]);
+        for i in 0..len {
+            self.shared.set_hdma_register(i, self.hdma_registers[i]);
+        }
         self.bg_palette_index = state.bg_palette_index;
+        self.shared.set_bg_palette_index(state.bg_palette_index);
         self.obj_palette_index = state.obj_palette_index;
+        self.shared.set_obj_palette_index(state.obj_palette_index);
         let len = state.bg_palette_ram.len().min(PALETTE_RAM_LEN);
         self.bg_palette_ram[..len].copy_from_slice(&state.bg_palette_ram[..len]);
+        self.shared.bg_palette_mut_slice()[..len]
+            .copy_from_slice(&self.bg_palette_ram[..len]);
         let len = state.obj_palette_ram.len().min(PALETTE_RAM_LEN);
         self.obj_palette_ram[..len].copy_from_slice(&state.obj_palette_ram[..len]);
+        self.shared.obj_palette_mut_slice()[..len]
+            .copy_from_slice(&self.obj_palette_ram[..len]);
         self.dots_into_line = state.dots_into_line;
         self.stat_interrupt_line = state.stat_interrupt_line;
         self.stat_interrupt_armed = state.stat_interrupt_armed;
@@ -303,9 +345,13 @@ impl PpuThread {
         self.dots = state.dots;
         self.frames = state.frames;
         self.hardware_mode = state.hardware_mode;
+        self.shared.set_hardware_mode(state.hardware_mode);
+        self.shared.set_lcd_enabled(self.lcd_enabled());
         // Transient rendering data
         self.oam_dma = None;
+        self.shared.set_oam_dma_active(false);
         self.hdma = None;
+        self.shared.set_hdma_status(0xFF);
         // Rebuild rendering snapshots from the restored VRAM/OAM
         self.snapshot_vram_for_rendering();
         self.report_dirty = true;
@@ -327,8 +373,7 @@ impl PpuThread {
                             ReadResult::Ready(0xff)
                         } else {
                             ReadResult::Ready(
-                                self.vram_banks[self.selected_vram_bank as usize]
-                                    [(address - 0x8000) as usize],
+                                self.vram_read(self.selected_vram_bank as usize, (address - 0x8000) as usize),
                             )
                         }
                     }
@@ -336,11 +381,11 @@ impl PpuThread {
                         if self.oam_dma.is_some() || mode >= 2 {
                             ReadResult::Ready(0xff)
                         } else {
-                            ReadResult::Ready(self.oam[(address - 0xfe00) as usize])
+                            ReadResult::Ready(self.oam_read((address - 0xfe00) as usize))
                         }
                     }
                     0xff40..=0xff4b => {
-                        ReadResult::Ready(self.lcd_registers[(address - 0xff40) as usize])
+                        ReadResult::Ready(self.lcd_reg((address - 0xff40) as usize))
                     }
                     0xff4f if matches!(self.hardware_mode, HardwareMode::DmgCompatibility) => {
                         ReadResult::Ready(0xff)
@@ -387,13 +432,12 @@ impl PpuThread {
                 let result = match address {
                     0x8000..=0x9fff => {
                         if mode != 3 {
-                            self.vram_banks[self.selected_vram_bank as usize]
-                                [(address - 0x8000) as usize] = value;
+                            self.vram_write(self.selected_vram_bank as usize, (address - 0x8000) as usize, value);
                             trace_ppu_memory_write(
                                 self.frames,
                                 address,
                                 value,
-                                self.lcd_registers[LY_INDEX],
+                                self.lcd_reg(LY_INDEX),
                                 self.dots_into_line,
                                 mode,
                                 if self.selected_vram_bank == 0 {
@@ -407,12 +451,12 @@ impl PpuThread {
                     }
                     0xfe00..=0xfe9f => {
                         if self.oam_dma.is_none() && mode < 2 {
-                            self.oam[(address - 0xfe00) as usize] = value;
+                            self.oam_write((address - 0xfe00) as usize, value);
                             trace_ppu_memory_write(
                                 self.frames,
                                 address,
                                 value,
-                                self.lcd_registers[LY_INDEX],
+                                self.lcd_reg(LY_INDEX),
                                 self.dots_into_line,
                                 mode,
                                 "oam",
@@ -424,17 +468,17 @@ impl PpuThread {
                         trace_split_write(
                             address,
                             value,
-                            self.lcd_registers[LY_INDEX],
+                            self.lcd_reg(LY_INDEX),
                             self.dots_into_line,
                             self.current_mode(),
                         );
                         let was_enabled = self.lcd_enabled();
-                        self.lcd_registers[LCDC_INDEX] = value;
+                        self.set_lcd_reg(LCDC_INDEX, value);
                         trace_ppu_memory_write(
                             self.frames,
                             address,
                             value,
-                            self.lcd_registers[LY_INDEX],
+                            self.lcd_reg(LY_INDEX),
                             self.dots_into_line,
                             self.current_mode(),
                             "reg",
@@ -445,15 +489,15 @@ impl PpuThread {
                         WriteResult::Accepted
                     }
                     0xff41 => {
-                        let mode_flags = self.lcd_registers[STAT_INDEX]
+                        let mode_flags = self.lcd_reg(STAT_INDEX)
                             & (STAT_MODE_FLAG_MASK | STAT_LYC_FLAG_MASK);
-                        self.lcd_registers[STAT_INDEX] =
-                            STAT_UNUSED_MASK | (value & 0x78) | mode_flags;
+                        self.set_lcd_reg(STAT_INDEX,
+                            STAT_UNUSED_MASK | (value & 0x78) | mode_flags);
                         trace_ppu_memory_write(
                             self.frames,
                             address,
                             value,
-                            self.lcd_registers[LY_INDEX],
+                            self.lcd_reg(LY_INDEX),
                             self.dots_into_line,
                             self.current_mode(),
                             "reg",
@@ -462,13 +506,13 @@ impl PpuThread {
                         WriteResult::Accepted
                     }
                     0xff44 => {
-                        self.lcd_registers[LY_INDEX] = 0;
+                        self.set_lcd_reg(LY_INDEX, 0);
                         self.dots_into_line = 0;
                         trace_ppu_memory_write(
                             self.frames,
                             address,
                             value,
-                            self.lcd_registers[LY_INDEX],
+                            self.lcd_reg(LY_INDEX),
                             self.dots_into_line,
                             self.current_mode(),
                             "reg",
@@ -477,12 +521,12 @@ impl PpuThread {
                         WriteResult::Accepted
                     }
                     0xff45 => {
-                        self.lcd_registers[LYC_INDEX] = value;
+                        self.set_lcd_reg(LYC_INDEX, value);
                         trace_ppu_memory_write(
                             self.frames,
                             address,
                             value,
-                            self.lcd_registers[LY_INDEX],
+                            self.lcd_reg(LY_INDEX),
                             self.dots_into_line,
                             self.current_mode(),
                             "reg",
@@ -491,12 +535,12 @@ impl PpuThread {
                         WriteResult::Accepted
                     }
                     0xff46 => {
-                        self.lcd_registers[(address - 0xff40) as usize] = value;
+                        self.set_lcd_reg((address - 0xff40) as usize, value);
                         trace_ppu_memory_write(
                             self.frames,
                             address,
                             value,
-                            self.lcd_registers[LY_INDEX],
+                            self.lcd_reg(LY_INDEX),
                             self.dots_into_line,
                             self.current_mode(),
                             "reg",
@@ -508,16 +552,16 @@ impl PpuThread {
                         trace_split_write(
                             address,
                             value,
-                            self.lcd_registers[LY_INDEX],
+                            self.lcd_reg(LY_INDEX),
                             self.dots_into_line,
                             self.current_mode(),
                         );
-                        self.lcd_registers[(address - 0xff40) as usize] = value;
+                        self.set_lcd_reg((address - 0xff40) as usize, value);
                         trace_ppu_memory_write(
                             self.frames,
                             address,
                             value,
-                            self.lcd_registers[LY_INDEX],
+                            self.lcd_reg(LY_INDEX),
                             self.dots_into_line,
                             self.current_mode(),
                             "reg",
@@ -531,11 +575,12 @@ impl PpuThread {
                     }
                     0xff4f => {
                         self.selected_vram_bank = value & 0x01;
+                        self.shared.set_selected_vram_bank(self.selected_vram_bank);
                         trace_ppu_memory_write(
                             self.frames,
                             address,
                             value,
-                            self.lcd_registers[LY_INDEX],
+                            self.lcd_reg(LY_INDEX),
                             self.dots_into_line,
                             self.current_mode(),
                             "reg",
@@ -543,21 +588,25 @@ impl PpuThread {
                         WriteResult::Accepted
                     }
                     0xff51..=0xff54 => {
-                        self.hdma_registers[(address - 0xff51) as usize] = value;
+                        let i = (address - 0xff51) as usize;
+                        self.hdma_registers[i] = value;
+                        self.shared.set_hdma_register(i, value);
                         WriteResult::Accepted
                     }
                     0xff55 => {
                         self.hdma_registers[4] = value;
+                        self.shared.set_hdma_register(4, value);
                         self.start_hdma(value);
                         WriteResult::Accepted
                     }
                     0xff68 => {
                         self.bg_palette_index = sanitize_palette_index(value);
+                        self.shared.set_bg_palette_index(self.bg_palette_index);
                         trace_ppu_memory_write(
                             self.frames,
                             address,
                             value,
-                            self.lcd_registers[LY_INDEX],
+                            self.lcd_reg(LY_INDEX),
                             self.dots_into_line,
                             self.current_mode(),
                             "reg",
@@ -567,11 +616,12 @@ impl PpuThread {
                     0xff69 => {
                         let address = self.bg_palette_address();
                         self.bg_palette_ram[address] = value;
+                        self.shared.bg_palette_mut_slice()[address] = value;
                         trace_ppu_memory_write(
                             self.frames,
                             0xff69,
                             value,
-                            self.lcd_registers[LY_INDEX],
+                            self.lcd_reg(LY_INDEX),
                             self.dots_into_line,
                             self.current_mode(),
                             "bgp",
@@ -581,11 +631,12 @@ impl PpuThread {
                     }
                     0xff6a => {
                         self.obj_palette_index = sanitize_palette_index(value);
+                        self.shared.set_obj_palette_index(self.obj_palette_index);
                         trace_ppu_memory_write(
                             self.frames,
                             address,
                             value,
-                            self.lcd_registers[LY_INDEX],
+                            self.lcd_reg(LY_INDEX),
                             self.dots_into_line,
                             self.current_mode(),
                             "reg",
@@ -595,11 +646,12 @@ impl PpuThread {
                     0xff6b => {
                         let address = self.obj_palette_address();
                         self.obj_palette_ram[address] = value;
+                        self.shared.obj_palette_mut_slice()[address] = value;
                         trace_ppu_memory_write(
                             self.frames,
                             0xff6b,
                             value,
-                            self.lcd_registers[LY_INDEX],
+                            self.lcd_reg(LY_INDEX),
                             self.dots_into_line,
                             self.current_mode(),
                             "obp",
@@ -627,17 +679,23 @@ impl PpuThread {
         clock: MasterClock,
         frame_ready: SyncSender<PublishedFrame>,
         frame_recycle: Receiver<Vec<u8>>,
+        shared: super::component::SharedPpuState,
     ) -> Self {
+        // Populate shared state from init_state
+        shared.oam_mut_slice()[..OAM_SIZE].copy_from_slice(&init_state.oam);
+        for (i, &v) in init_state.lcd_registers.iter().enumerate() {
+            shared.lcd_reg_write(i, v);
+        }
+        shared.set_selected_vram_bank(init_state.selected_vram_bank);
+        shared.set_hardware_mode(init_state.hardware_mode);
         let mut ppu = Self {
             bus,
             clock,
             interrupt_flags,
             dots: 0,
             hardware_mode: init_state.hardware_mode,
-            vram_banks: vec![vec![0; VRAM_BANK_SIZE]; VRAM_BANKS],
+            shared,
             selected_vram_bank: init_state.selected_vram_bank,
-            oam: init_state.oam,
-            lcd_registers: init_state.lcd_registers,
             hdma_registers: init_state.hdma_registers,
             bg_palette_index: sanitize_palette_index(init_state.bg_palette_index),
             obj_palette_index: sanitize_palette_index(init_state.obj_palette_index),
@@ -661,11 +719,21 @@ impl PpuThread {
             hdma: None,
             scanline_registers: [ScanlineRegisters::default(); SCREEN_HEIGHT],
             window_line: 0,
-            rendering_vram: vec![vec![0; VRAM_BANK_SIZE]; VRAM_BANKS],
-            rendering_oam: init_state.oam,
             progress: super::component::PpuProgress::new(),
         };
-        ppu.lcd_registers[STAT_INDEX] |= STAT_UNUSED_MASK;
+        // Sync palette and HDMA state to shared state
+        ppu.shared.set_bg_palette_index(ppu.bg_palette_index);
+        ppu.shared.set_obj_palette_index(ppu.obj_palette_index);
+        ppu.shared.bg_palette_mut_slice()[..PALETTE_RAM_LEN]
+            .copy_from_slice(&ppu.bg_palette_ram);
+        ppu.shared.obj_palette_mut_slice()[..PALETTE_RAM_LEN]
+            .copy_from_slice(&ppu.obj_palette_ram);
+        for i in 0..HDMA_REGISTERS_LEN {
+            ppu.shared.set_hdma_register(i, ppu.hdma_registers[i]);
+        }
+        ppu.shared.set_hdma_status(0xFF); // no HDMA active at init
+
+        ppu.set_lcd_reg(STAT_INDEX, ppu.lcd_reg(STAT_INDEX) | STAT_UNUSED_MASK);
         ppu.refresh_scanline_defaults();
         ppu.update_stat_mode();
         ppu
@@ -695,7 +763,7 @@ impl PpuThread {
 
     fn step_dot(&mut self) {
         if !self.lcd_enabled() {
-            self.lcd_registers[LY_INDEX] = 0;
+            self.set_lcd_reg(LY_INDEX, 0);
             self.dots_into_line = 0;
             self.update_stat_mode();
             return;
@@ -704,7 +772,7 @@ impl PpuThread {
         self.dots_into_line += 1;
 
         if self.dots_into_line == MODE2_DOTS + MODE3_DOTS {
-            let line = self.lcd_registers[LY_INDEX];
+            let line = self.lcd_reg(LY_INDEX);
             if line < VISIBLE_LINES {
                 self.scanline_registers[line as usize] = self.capture_scanline_registers();
                 self.render_scanline(line as usize);
@@ -714,8 +782,8 @@ impl PpuThread {
 
         if self.dots_into_line >= DOTS_PER_LINE {
             self.dots_into_line = 0;
-            let next_line = (self.lcd_registers[LY_INDEX] + 1) % TOTAL_LINES;
-            self.lcd_registers[LY_INDEX] = next_line;
+            let next_line = (self.lcd_reg(LY_INDEX) + 1) % TOTAL_LINES;
+            self.set_lcd_reg(LY_INDEX, next_line);
 
             if next_line == VISIBLE_LINES {
                 self.frames = self.frames.wrapping_add(1);
@@ -738,11 +806,11 @@ impl PpuThread {
     }
 
     fn lcd_enabled(&self) -> bool {
-        self.lcd_registers[LCDC_INDEX] & LCDC_ENABLE_MASK != 0
+        self.lcd_reg(LCDC_INDEX) & LCDC_ENABLE_MASK != 0
     }
 
     fn current_mode(&self) -> u8 {
-        let line = self.lcd_registers[LY_INDEX];
+        let line = self.lcd_reg(LY_INDEX);
         if line >= VISIBLE_LINES {
             1
         } else if self.dots_into_line < MODE2_DOTS {
@@ -755,8 +823,9 @@ impl PpuThread {
     }
 
     fn update_lcd_state(&mut self, was_enabled: bool) {
-        if !self.lcd_enabled() {
-            self.lcd_registers[LY_INDEX] = 0;
+        let enabled = self.lcd_enabled();
+        if !enabled {
+            self.set_lcd_reg(LY_INDEX, 0);
             self.dots_into_line = 0;
             self.window_line = 0;
             self.stat_interrupt_line = false;
@@ -766,7 +835,7 @@ impl PpuThread {
             self.framebuffer_dirty = true;
             self.report_framebuffer_pending = true;
         } else if !was_enabled {
-            self.lcd_registers[LY_INDEX] = 0;
+            self.set_lcd_reg(LY_INDEX, 0);
             self.dots_into_line = 0;
             self.window_line = 0;
             self.stat_interrupt_line = false;
@@ -774,6 +843,7 @@ impl PpuThread {
             self.refresh_scanline_defaults();
             self.report_dirty = true;
         }
+        self.shared.set_lcd_enabled(enabled);
         self.update_stat_mode();
     }
 
@@ -783,24 +853,25 @@ impl PpuThread {
         } else {
             0
         };
-        let ly = self.lcd_registers[LY_INDEX];
-        let lyc = self.lcd_registers[LYC_INDEX];
+        let ly = self.lcd_reg(LY_INDEX);
+        let lyc = self.lcd_reg(LYC_INDEX);
         let coincidence = ly == lyc;
 
-        let mut stat = self.lcd_registers[STAT_INDEX] & !(STAT_MODE_FLAG_MASK | STAT_LYC_FLAG_MASK);
+        let mut stat = self.lcd_reg(STAT_INDEX) & !(STAT_MODE_FLAG_MASK | STAT_LYC_FLAG_MASK);
         stat |= STAT_UNUSED_MASK | mode;
         if coincidence {
             stat |= STAT_LYC_FLAG_MASK;
         }
 
-        if self.lcd_registers[STAT_INDEX] != stat {
-            self.lcd_registers[STAT_INDEX] = stat;
+        if self.lcd_reg(STAT_INDEX) != stat {
+            self.set_lcd_reg(STAT_INDEX, stat);
         }
+        self.shared.set_mode(mode);
         self.refresh_stat_interrupt_line();
     }
 
     fn refresh_stat_interrupt_line(&mut self) {
-        let stat = self.lcd_registers[STAT_INDEX];
+        let stat = self.lcd_reg(STAT_INDEX);
         let mode = stat & STAT_MODE_FLAG_MASK;
         let coincidence = stat & STAT_LYC_FLAG_MASK != 0;
         let mode0 = mode == 0 && stat & STAT_MODE0_INTERRUPT_MASK != 0;
@@ -928,6 +999,7 @@ impl PpuThread {
             if let Some(hdma) = &self.hdma {
                 if hdma.hblank_mode {
                     self.hdma = None;
+                    self.shared.set_hdma_status(0xFF);
                     return;
                 }
             }
@@ -949,6 +1021,7 @@ impl PpuThread {
                 remaining_blocks: blocks,
                 hblank_mode: true,
             });
+            self.shared.set_hdma_status(blocks.saturating_sub(1));
         } else {
             // General-purpose DMA: transfer all blocks immediately.
             self.execute_gp_dma(source, 0x8000 | destination, blocks);
@@ -963,13 +1036,14 @@ impl PpuThread {
                 let bank = self.selected_vram_bank as usize;
                 let offset = (dest_addr & 0x1fff) as usize;
                 if offset < VRAM_BANK_SIZE {
-                    self.vram_banks[bank][offset] = byte;
+                    self.vram_write(bank, offset, byte);
                 }
             }
             source = source.wrapping_add(16);
             destination = destination.wrapping_add(16);
         }
         self.hdma = None;
+        self.shared.set_hdma_status(0xFF);
     }
 
     fn advance_hblank_dma(&mut self) {
@@ -987,7 +1061,7 @@ impl PpuThread {
             let bank = self.selected_vram_bank as usize;
             let offset = (dest_addr & 0x1fff) as usize;
             if offset < VRAM_BANK_SIZE {
-                self.vram_banks[bank][offset] = byte;
+                self.vram_write(bank, offset, byte);
             }
         }
         hdma.source = hdma.source.wrapping_add(16);
@@ -996,6 +1070,10 @@ impl PpuThread {
 
         if hdma.remaining_blocks > 0 {
             self.hdma = Some(hdma);
+            self.shared
+                .set_hdma_status(hdma.remaining_blocks.saturating_sub(1));
+        } else {
+            self.shared.set_hdma_status(0xFF);
         }
     }
 
@@ -1021,13 +1099,14 @@ impl PpuThread {
             next_index: 0,
             pending_read: None,
         });
+        self.shared.set_oam_dma_active(true);
     }
 
     fn advance_oam_dma(&mut self) {
         let mut transferred = 0;
 
         while transferred < OAM_DMA_BYTES_PER_SAMPLE {
-            let ly = self.lcd_registers[LY_INDEX];
+            let ly = self.lcd_reg(LY_INDEX);
             let dots = self.dots_into_line;
             let mode = self.current_mode();
             let Some(dma) = self.oam_dma.as_mut() else {
@@ -1044,7 +1123,7 @@ impl PpuThread {
                     ReadResult::NoData => 0xff,
                 };
 
-                self.oam[index] = value;
+                self.shared.oam_mut_slice()[index] = value;
                 dma.next_index = index + 1;
                 trace_ppu_memory_write(
                     self.frames,
@@ -1059,6 +1138,7 @@ impl PpuThread {
 
                 if dma.next_index >= OAM_SIZE {
                     self.oam_dma = None;
+                    self.shared.set_oam_dma_active(false);
                     return;
                 }
 
@@ -1067,6 +1147,7 @@ impl PpuThread {
 
             if dma.next_index >= OAM_SIZE {
                 self.oam_dma = None;
+                self.shared.set_oam_dma_active(false);
                 return;
             }
 
@@ -1153,7 +1234,7 @@ impl PpuThread {
 
         for sprite_index in 0..MAX_SPRITES {
             let base = sprite_index * OAM_ENTRY_SIZE;
-            let sprite_y = self.oam[base] as i16 - 16;
+            let sprite_y = self.oam_read(base) as i16 - 16;
 
             if (y as i16) < sprite_y || (y as i16) >= sprite_y + sprite_height {
                 continue;
@@ -1170,7 +1251,7 @@ impl PpuThread {
         // ties broken by OAM position. CGB: strictly by OAM position.
         if !matches!(self.hardware_mode, HardwareMode::Cgb) {
             visible[..visible_count].sort_by_key(|&i| {
-                let x = self.oam[i * OAM_ENTRY_SIZE + 1];
+                let x = self.oam_read(i * OAM_ENTRY_SIZE + 1);
                 (x, i as u8)
             });
         }
@@ -1189,10 +1270,10 @@ impl PpuThread {
         registers: ScanlineRegisters,
     ) {
         let base = sprite_index * OAM_ENTRY_SIZE;
-        let sprite_y = self.oam[base] as i16 - 16;
-        let sprite_x = self.oam[base + 1] as i16 - 8;
-        let mut tile_number = self.oam[base + 2];
-        let attributes = self.oam[base + 3];
+        let sprite_y = self.oam_read(base) as i16 - 16;
+        let sprite_x = self.oam_read(base + 1) as i16 - 8;
+        let mut tile_number = self.oam_read(base + 2);
+        let attributes = self.oam_read(base + 3);
         let line_in_sprite = y as i16 - sprite_y;
         let row_in_sprite = if attributes & SPRITE_ATTR_Y_FLIP_MASK != 0 {
             sprite_height - 1 - line_in_sprite
@@ -1298,9 +1379,9 @@ impl PpuThread {
         let tile_x = (map_x as usize / 8) & 0x1f;
         let tile_y = (map_y as usize / 8) & 0x1f;
         let map_index = tile_map_base + tile_y * 32 + tile_x;
-        let tile_number = self.vram_banks[0][map_index];
+        let tile_number = self.vram_read(0, map_index);
         let attributes = if matches!(self.hardware_mode, HardwareMode::Cgb) {
-            self.vram_banks[1][map_index]
+            self.vram_read(1, map_index)
         } else {
             0
         };
@@ -1338,14 +1419,14 @@ impl PpuThread {
 
     fn capture_scanline_registers(&self) -> ScanlineRegisters {
         ScanlineRegisters {
-            lcdc: self.lcd_registers[LCDC_INDEX],
-            scy: self.lcd_registers[SCY_INDEX],
-            scx: self.lcd_registers[SCX_INDEX],
-            bgp: self.lcd_registers[BGP_INDEX],
-            obp0: self.lcd_registers[OBP0_INDEX],
-            obp1: self.lcd_registers[OBP1_INDEX],
-            wy: self.lcd_registers[WY_INDEX],
-            wx: self.lcd_registers[WX_INDEX],
+            lcdc: self.lcd_reg(LCDC_INDEX),
+            scy: self.lcd_reg(SCY_INDEX),
+            scx: self.lcd_reg(SCX_INDEX),
+            bgp: self.lcd_reg(BGP_INDEX),
+            obp0: self.lcd_reg(OBP0_INDEX),
+            obp1: self.lcd_reg(OBP1_INDEX),
+            wy: self.lcd_reg(WY_INDEX),
+            wx: self.lcd_reg(WX_INDEX),
         }
     }
 
@@ -1373,8 +1454,8 @@ impl PpuThread {
             (SIGNED_TILE_DATA_BASE + (tile_number as i8 as i32) * TILE_BYTES as i32) as usize
         };
         let row_base = tile_base + row_in_tile * 2;
-        let low = self.vram_banks[tile_bank][row_base];
-        let high = self.vram_banks[tile_bank][row_base + 1];
+        let low = self.vram_read(tile_bank, row_base);
+        let high = self.vram_read(tile_bank, row_base + 1);
         let bit = 7 - column_in_tile;
         ((high >> bit) & 0x01) << 1 | ((low >> bit) & 0x01)
     }
@@ -1395,12 +1476,14 @@ impl PpuThread {
     fn advance_bg_palette_index(&mut self) {
         if self.bg_palette_index & 0x80 != 0 {
             self.bg_palette_index = 0x80 | ((self.bg_palette_index + 1) & 0x3f);
+            self.shared.set_bg_palette_index(self.bg_palette_index);
         }
     }
 
     fn advance_obj_palette_index(&mut self) {
         if self.obj_palette_index & 0x80 != 0 {
             self.obj_palette_index = 0x80 | ((self.obj_palette_index + 1) & 0x3f);
+            self.shared.set_obj_palette_index(self.obj_palette_index);
         }
     }
 
@@ -1510,6 +1593,7 @@ impl Default for PpuThread {
             MasterClock::new(),
             frame_ready_sender,
             frame_recycle_receiver,
+            super::component::SharedPpuState::new(),
         )
     }
 }
@@ -1554,6 +1638,7 @@ mod tests {
                 MasterClock::new(),
                 frame_ready_sender,
                 frame_recycle_receiver,
+                crate::emulator::component::SharedPpuState::new(),
             ),
             frame_ready_receiver,
             reports_sender,
@@ -1591,18 +1676,18 @@ mod tests {
     #[test]
     fn render_background_uses_latched_scx_per_scanline() {
         let mut ppu = PpuThread::default();
-        ppu.lcd_registers[LCDC_INDEX] =
-            LCDC_ENABLE_MASK | LCDC_BG_ENABLE_MASK | LCDC_TILE_DATA_MASK;
+        ppu.set_lcd_reg(LCDC_INDEX,
+            LCDC_ENABLE_MASK | LCDC_BG_ENABLE_MASK | LCDC_TILE_DATA_MASK);
         ppu.bg_palette_ram[0] = 0xff;
         ppu.bg_palette_ram[1] = 0x7f;
-        ppu.vram_banks[0][0x0000] = 0xff;
-        ppu.vram_banks[0][0x0001] = 0xff;
-        ppu.vram_banks[0][0x0010] = 0x00;
-        ppu.vram_banks[0][0x0011] = 0x00;
-        ppu.vram_banks[0][BG_MAP_OFFSET_9800] = 0x00;
-        ppu.vram_banks[0][BG_MAP_OFFSET_9800 + 1] = 0x01;
-        ppu.vram_banks[0][BG_MAP_OFFSET_9800 + 32 * 4] = 0x00;
-        ppu.vram_banks[0][BG_MAP_OFFSET_9800 + 32 * 4 + 1] = 0x01;
+        ppu.vram_write(0, 0x0000, 0xff);
+        ppu.vram_write(0, 0x0001, 0xff);
+        ppu.vram_write(0, 0x0010, 0x00);
+        ppu.vram_write(0, 0x0011, 0x00);
+        ppu.vram_write(0, BG_MAP_OFFSET_9800, 0x00);
+        ppu.vram_write(0, BG_MAP_OFFSET_9800 + 1, 0x01);
+        ppu.vram_write(0, BG_MAP_OFFSET_9800 + 32 * 4, 0x00);
+        ppu.vram_write(0, BG_MAP_OFFSET_9800 + 32 * 4 + 1, 0x01);
         ppu.refresh_scanline_defaults();
         ppu.scanline_registers[32].scx = 8;
 

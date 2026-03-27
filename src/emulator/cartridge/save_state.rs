@@ -211,11 +211,12 @@ pub(super) fn create_save(controller: &CartridgeController, ram: &[u8], boot_rom
 
 pub(super) fn apply_save(
     controller: &mut CartridgeController,
-    ram: &mut Vec<u8>,
+    ram: &mut [u8],
     boot_rom_mapped: &mut bool,
     state: CartridgeSaveState,
 ) {
-    *ram = state.ram;
+    let len = state.ram.len().min(ram.len());
+    ram[..len].copy_from_slice(&state.ram[..len]);
     *boot_rom_mapped = state.boot_rom_mapped;
 
     match (controller, state.controller) {

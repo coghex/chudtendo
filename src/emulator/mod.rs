@@ -29,7 +29,8 @@ pub use component::{
 use bus::Bus;
 use component::{
     Command, ComponentReport, CpuInitState, InterruptFlags, MasterClock, PpuInitState,
-    SharedCartridgeReadState, TimerInitState, WramInitState,
+    SharedApuState, SharedCartridgeReadState, SharedPpuState, SharedTimerState, SharedWramState,
+    TimerInitState, WramInitState,
 };
 
 /// The full on-disk save state bundle.
@@ -337,6 +338,23 @@ impl Emulator {
             }
         }
 
+        let shared_wram = SharedWramState::new(
+            wram_init.banks.clone(),
+            component::select_wram_bank(wram_init.selected_bank),
+            wram_init.hardware_mode,
+        );
+        wram_init.shared = Some(shared_wram.clone());
+        cpu_init.shared_wram = Some(shared_wram);
+
+        let shared_timer = SharedTimerState::new();
+        cpu_init.shared_timer = Some(shared_timer.clone());
+
+        let shared_apu = SharedApuState::new();
+        cpu_init.shared_apu = Some(shared_apu.clone());
+
+        let shared_ppu = SharedPpuState::new();
+        cpu_init.shared_ppu = Some(shared_ppu.clone());
+
         let cpu_inbox = self
             .inboxes
             .cpu
@@ -375,6 +393,7 @@ impl Emulator {
             frame_ready_sender,
             frame_recycle_receiver,
             clock.clone(),
+            shared_ppu,
         );
         self.workers.push(WorkerHandle {
             name: "ppu",
@@ -382,6 +401,24 @@ impl Emulator {
         });
         self.ppu_progress = Some(ppu_progress.clone());
         cpu_init.ppu_progress = ppu_progress;
+
+        // Spawn cartridge before CPU so we can pass shared RAM state to the CPU.
+        let (cartridge_handle, shared_cartridge_ram) = cartridge::CartridgeThread::spawn(
+            self.config.cartridge.clone(),
+            boot_rom,
+            self.config.boot_seed,
+            Some(shared_cartridge),
+            self.config.save_path.clone(),
+            cartridge_inbox,
+            report_sender.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+        self.workers.push(WorkerHandle {
+            name: "cartridge",
+            handle: cartridge_handle,
+        });
+        cpu_init.shared_cartridge_ram = shared_cartridge_ram;
+
         self.workers.push(WorkerHandle {
             name: "cpu",
             handle: cpu::CpuThread::spawn(
@@ -401,19 +438,6 @@ impl Emulator {
             ),
         });
         self.workers.push(WorkerHandle {
-            name: "cartridge",
-            handle: cartridge::CartridgeThread::spawn(
-                self.config.cartridge.clone(),
-                boot_rom,
-                self.config.boot_seed,
-                Some(shared_cartridge),
-                self.config.save_path.clone(),
-                cartridge_inbox,
-                report_sender.clone(),
-            )
-            .map_err(|error| error.to_string())?,
-        });
-        self.workers.push(WorkerHandle {
             name: "timer",
             handle: timer::TimerThread::spawn(
                 timer_init,
@@ -422,6 +446,7 @@ impl Emulator {
                 interrupt_flags.clone(),
                 report_sender.clone(),
                 clock.clone(),
+                shared_timer,
             ),
         });
 
@@ -446,6 +471,7 @@ impl Emulator {
                 } else {
                     HardwareMode::Cgb
                 },
+                shared_apu,
             ),
         });
 
@@ -522,11 +548,14 @@ impl Emulator {
             }
         }
 
-        for frame in frames {
+        let last_index = frames.len().saturating_sub(1);
+        for (i, frame) in frames.into_iter().enumerate() {
             self.cached_snapshot.ppu_frames = self.cached_snapshot.ppu_frames.max(frame.frame);
-            self.cached_snapshot
-                .framebuffer
-                .clone_from(&frame.framebuffer);
+            if i == last_index {
+                self.cached_snapshot
+                    .framebuffer
+                    .clone_from(&frame.framebuffer);
+            }
             self.recycle_framebuffer(frame.framebuffer);
         }
     }
@@ -636,7 +665,7 @@ impl Emulator {
                     }
                 }
             }
-            thread::yield_now();
+            thread::sleep(Duration::from_micros(50));
         }
 
         let mut blobs = blobs.into_iter().map(|b| b.unwrap());
@@ -770,31 +799,31 @@ impl Emulator {
             if std::time::Instant::now() > deadline {
                 return None;
             }
-            std::thread::yield_now();
+            thread::sleep(Duration::from_micros(50));
         }
     }
 
     /// Set emulator speed multiplier. 1.0 = normal, 2.0 = double, 0.0 = uncapped.
     pub fn set_speed(&self, multiplier: f32) {
         let fixed = if multiplier <= 0.0 { 0 } else { (multiplier * 100.0) as u32 };
-        self.speed.store(fixed, std::sync::atomic::Ordering::Relaxed);
+        self.speed.store(fixed, std::sync::atomic::Ordering::Release);
     }
 
     pub fn pause(&self) {
-        self.paused.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.paused.store(true, std::sync::atomic::Ordering::Release);
     }
 
     pub fn resume(&self) {
-        self.paused.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.paused.store(false, std::sync::atomic::Ordering::Release);
     }
 
     pub fn toggle_pause(&self) -> bool {
-        let was_paused = self.paused.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
+        let was_paused = self.paused.fetch_xor(true, std::sync::atomic::Ordering::AcqRel);
         !was_paused // returns new paused state
     }
 
     pub fn is_paused(&self) -> bool {
-        self.paused.load(std::sync::atomic::Ordering::Relaxed)
+        self.paused.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn reset(&mut self) -> Result<(), String> {

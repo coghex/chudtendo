@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use super::component::{
     ApuReport, CPU_CLOCK_HZ, Command, ComponentReport, HardwareMode, MasterClock, MemoryCommand,
-    ReadResult, WriteResult,
+    ReadResult, SharedApuState, WriteResult,
 };
 
 #[derive(Serialize, Deserialize)]
@@ -128,6 +128,7 @@ pub struct ApuThread {
     clock: MasterClock,
     cycles: u64,
     hardware_mode: super::component::HardwareMode,
+    shared: SharedApuState,
     master_enable: bool,
     nr50: u8,
     nr51: u8,
@@ -208,22 +209,24 @@ impl ApuThread {
         sample_sender: SyncSender<[f32; 2]>,
         clock: MasterClock,
         hardware_mode: super::component::HardwareMode,
+        shared: SharedApuState,
     ) -> thread::JoinHandle<()> {
         thread::Builder::new()
             .name("apu".to_owned())
             .spawn(move || {
-                let mut apu = Self::new(sample_sender, clock.clone());
+                let mut apu = Self::new(sample_sender, clock.clone(), shared);
                 apu.hardware_mode = hardware_mode;
                 apu.run(inbox, reports, clock)
             })
             .expect("failed to spawn apu thread")
     }
 
-    fn new(sample_sender: SyncSender<[f32; 2]>, clock: MasterClock) -> Self {
+    fn new(sample_sender: SyncSender<[f32; 2]>, clock: MasterClock, shared: SharedApuState) -> Self {
         Self {
             clock,
             cycles: 0,
             hardware_mode: super::component::HardwareMode::Cgb,
+            shared,
             master_enable: false,
             nr50: 0,
             nr51: 0,
@@ -453,6 +456,7 @@ impl ApuThread {
         self.samples_emitted = state.samples_emitted;
         self.cycles = state.cycles;
         self.hardware_mode = state.hardware_mode;
+        self.sync_shared();
     }
 
     fn chase_clock(&mut self) {
@@ -520,6 +524,7 @@ impl ApuThread {
                     self.chase_clock();
                 }
                 self.write_register(address, value);
+                self.sync_shared();
                 if let Some(respond_to) = respond_to {
                     let _ = respond_to.send(WriteResult::Accepted);
                 }
@@ -640,6 +645,22 @@ impl ApuThread {
             }
             _ => {}
         }
+    }
+
+    /// Push current register state and NR52 status to the shared atomics
+    /// so the CPU can read them without a channel round-trip.
+    fn sync_shared(&self) {
+        for i in 0..0x17 {
+            self.shared.set_register(i, self.registers[i]);
+        }
+        let status = if self.master_enable { 0x80 } else { 0x00 }
+            | if self.channel1.enabled { 0x01 } else { 0x00 }
+            | if self.channel2.enabled { 0x02 } else { 0x00 }
+            | if self.channel3.enabled { 0x04 } else { 0x00 }
+            | if self.channel4.enabled { 0x08 } else { 0x00 };
+        self.shared.set_nr52_status(status);
+        self.shared.set_ch3_enabled(self.channel3.enabled);
+        self.shared.wave_ram_mut_slice().copy_from_slice(&self.wave_ram);
     }
 
     fn write_channel1(&mut self, address: u16, value: u8) {
@@ -993,6 +1014,15 @@ impl ApuThread {
         if self.frame_sequencer_counter >= FRAME_SEQUENCER_PERIOD {
             self.frame_sequencer_counter = 0;
             self.clock_frame_sequencer();
+            // Channel enabled flags may have changed (length counter expiry,
+            // sweep overflow).  Update NR52 so the CPU sees current status.
+            let status = if self.master_enable { 0x80 } else { 0x00 }
+                | if self.channel1.enabled { 0x01 } else { 0x00 }
+                | if self.channel2.enabled { 0x02 } else { 0x00 }
+                | if self.channel3.enabled { 0x04 } else { 0x00 }
+                | if self.channel4.enabled { 0x08 } else { 0x00 };
+            self.shared.set_nr52_status(status);
+            self.shared.set_ch3_enabled(self.channel3.enabled);
         }
 
         // Pulse channels: period timer ticks every 4 T-cycles.
@@ -1108,17 +1138,17 @@ impl ApuThread {
         let left_vol = ((self.nr50 >> 4) & 0x07) as f32 + 1.0;
         let right_vol = (self.nr50 & 0x07) as f32 + 1.0;
 
-        left = (left / 4.0) * (left_vol / 8.0);
-        right = (right / 4.0) * (right_vol / 8.0);
+        left = left * 0.25 * (left_vol * 0.125);
+        right = right * 0.25 * (right_vol * 0.125);
 
         // High-pass filter: models the Game Boy's capacitor-coupled output.
         // Removes DC offset that causes buzzing during quiet passages.
         // Charge factor ~0.998 gives a ~20 Hz cutoff at 48 kHz sample rate.
-        const CHARGE_FACTOR: f32 = 0.998;
+        const HPF_DECAY: f32 = 0.002; // 1.0 - 0.998 charge factor; ~20 Hz cutoff at 48 kHz
         let hpf_left_out = left - self.hpf_left;
-        self.hpf_left += hpf_left_out * (1.0 - CHARGE_FACTOR);
+        self.hpf_left += hpf_left_out * HPF_DECAY;
         let hpf_right_out = right - self.hpf_right;
-        self.hpf_right += hpf_right_out * (1.0 - CHARGE_FACTOR);
+        self.hpf_right += hpf_right_out * HPF_DECAY;
 
         self.samples_emitted += 1;
         let _ = self.sample_sender.try_send([hpf_left_out, hpf_right_out]);
@@ -1169,7 +1199,7 @@ impl PulseChannel {
         } else {
             0
         };
-        (digital as f32 / 7.5) - 1.0
+        digital as f32 * (2.0 / 15.0) - 1.0
     }
 }
 
@@ -1219,7 +1249,7 @@ impl WaveChannel {
             3 => self.sample_buffer >> 2,
             _ => 0,
         };
-        (shifted as f32 / 7.5) - 1.0
+        shifted as f32 * (2.0 / 15.0) - 1.0
     }
 }
 
@@ -1266,7 +1296,7 @@ impl NoiseChannel {
             return 0.0;
         }
         let digital = if self.lfsr & 1 == 0 { self.volume } else { 0 };
-        (digital as f32 / 7.5) - 1.0
+        digital as f32 * (2.0 / 15.0) - 1.0
     }
 }
 

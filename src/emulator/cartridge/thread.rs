@@ -6,7 +6,7 @@ use rand::{RngCore, SeedableRng};
 
 use crate::emulator::component::{
     CartridgeReport, Command, ComponentReport, MemoryCommand, ReadResult,
-    SharedCartridgeReadState, WriteResult,
+    SharedCartridgeRamState, SharedCartridgeReadState, WriteResult,
 };
 
 use super::controller::{CartridgeController, HuC1State, HuC3State, Mbc1State, Mbc2State, Mbc3State, Mbc5State, Mbc6State, Mbc7State, Mmm01State, PocketCameraState, Tama5State};
@@ -23,8 +23,8 @@ pub struct CartridgeThread {
     boot_rom_mapped: bool,
     controller: CartridgeController,
     shared_read_state: Option<SharedCartridgeReadState>,
+    shared_ram_state: Option<SharedCartridgeRamState>,
     rom: Vec<u8>,
-    ram: Vec<u8>,
     save_path: Option<std::path::PathBuf>,
     steps: u64,
     last_reported_rom_bank: u8,
@@ -42,12 +42,14 @@ impl CartridgeThread {
         save_path: Option<std::path::PathBuf>,
         inbox: Receiver<Command>,
         reports: Sender<ComponentReport>,
-    ) -> Result<thread::JoinHandle<()>, CartridgeLoadError> {
+    ) -> Result<(thread::JoinHandle<()>, Option<SharedCartridgeRamState>), CartridgeLoadError> {
         let cartridge = Self::from_image(image, boot_rom, boot_seed, shared_read_state, save_path)?;
-        Ok(thread::Builder::new()
+        let shared_ram = cartridge.shared_ram_state.clone();
+        let handle = thread::Builder::new()
             .name("cartridge".into())
             .spawn(move || cartridge.run(inbox, reports))
-            .expect("failed to spawn cartridge thread"))
+            .expect("failed to spawn cartridge thread");
+        Ok((handle, shared_ram))
     }
 
     pub(super) fn from_image(
@@ -96,19 +98,40 @@ impl CartridgeThread {
             }
         }
 
+        let standard = controller.uses_standard_ram();
+        let shared_ram_state = Some(SharedCartridgeRamState::new(
+            ram,
+            metadata.ram_bank_count,
+            metadata.ram_size,
+            standard,
+        ));
+        // Sync initial state.
+        if let Some(ref shared) = shared_ram_state {
+            shared.set_ram_enabled(controller.ram_enabled());
+            shared.set_selected_ram_bank(controller.selected_ram_bank(&metadata));
+        }
+
         Ok(Self {
             boot_rom,
             boot_rom_mapped: true,
-            ram,
             metadata,
             controller,
             shared_read_state,
+            shared_ram_state,
             rom: image.rom,
             save_path,
             steps: 0,
             last_reported_rom_bank: 1,
             last_reported_ram_bank: 0,
         })
+    }
+
+    fn ram(&self) -> &[u8] {
+        self.shared_ram_state.as_ref().map(|s| s.ram_slice()).unwrap_or(&[])
+    }
+
+    fn ram_mut(&self) -> &mut [u8] {
+        self.shared_ram_state.as_ref().map(|s| s.ram_mut_slice()).unwrap_or(&mut [])
     }
 
     fn run(
@@ -124,15 +147,16 @@ impl CartridgeThread {
                     Ok(Command::Memory(command)) => self.handle_memory(command),
                     Ok(Command::SetHardwareMode(_)) => {}
                     Ok(Command::SaveState(respond_to)) => {
-                        let state = save_state::create_save(&self.controller, &self.ram, self.boot_rom_mapped);
+                        let state = save_state::create_save(&self.controller, self.ram(), self.boot_rom_mapped);
                         let bytes = bincode::serialize(&state).unwrap_or_default();
                         let _ = respond_to.send(bytes);
                     }
                     Ok(Command::LoadState(bytes)) => {
                         if let Ok(state) = bincode::deserialize::<CartridgeSaveState>(&bytes) {
+                            let ram = self.shared_ram_state.as_ref().map(|s| s.ram_mut_slice()).unwrap_or(&mut []);
                             save_state::apply_save(
                                 &mut self.controller,
-                                &mut self.ram,
+                                ram,
                                 &mut self.boot_rom_mapped,
                                 state,
                             );
@@ -180,7 +204,7 @@ impl CartridgeThread {
         // Persist battery-backed RAM on shutdown.
         if self.metadata.has_battery() {
             if let Some(path) = &self.save_path {
-                save_state::write_save_file(path, &self.ram, &self.controller, &self.metadata);
+                save_state::write_save_file(path, self.ram(), &self.controller, &self.metadata);
             }
         }
     }
@@ -197,10 +221,10 @@ impl CartridgeThread {
                     if let Some(byte) = self.boot_rom.read(address) {
                         ReadResult::Ready(byte)
                     } else {
-                        self.controller.read(&self.metadata, &self.rom, &self.ram, address)
+                        self.controller.read(&self.metadata, &self.rom, self.ram(), address)
                     }
                 } else {
-                    self.controller.read(&self.metadata, &self.rom, &self.ram, address)
+                    self.controller.read(&self.metadata, &self.rom, self.ram(), address)
                 };
                 let _ = respond_to.send(result);
             }
@@ -218,7 +242,8 @@ impl CartridgeThread {
                     }
                     WriteResult::Accepted
                 } else {
-                    let result = self.controller.write(&self.metadata, &mut self.ram, address, value);
+                    let ram = self.shared_ram_state.as_ref().map(|s| s.ram_mut_slice()).unwrap_or(&mut []);
+                    let result = self.controller.write(&self.metadata, ram, address, value);
                     if matches!(result, WriteResult::Accepted) {
                         self.publish_shared_bank_state();
                     }
@@ -232,11 +257,13 @@ impl CartridgeThread {
     }
 
     fn publish_shared_bank_state(&self) {
-        let Some(shared_read_state) = &self.shared_read_state else {
-            return;
-        };
-
-        shared_read_state.set_lower_rom_bank(self.controller.lower_rom_bank(&self.metadata));
-        shared_read_state.set_selected_rom_bank(self.controller.selected_rom_bank(&self.metadata));
+        if let Some(shared_read_state) = &self.shared_read_state {
+            shared_read_state.set_lower_rom_bank(self.controller.lower_rom_bank(&self.metadata));
+            shared_read_state.set_selected_rom_bank(self.controller.selected_rom_bank(&self.metadata));
+        }
+        if let Some(shared_ram) = &self.shared_ram_state {
+            shared_ram.set_ram_enabled(self.controller.ram_enabled());
+            shared_ram.set_selected_ram_bank(self.controller.selected_ram_bank(&self.metadata));
+        }
     }
 }

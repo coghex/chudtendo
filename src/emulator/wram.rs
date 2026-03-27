@@ -4,8 +4,8 @@ use std::thread;
 use serde::{Deserialize, Serialize};
 
 use super::component::{
-    Command, ComponentReport, HardwareMode, MemoryCommand, ReadResult, WramInitState, WramReport,
-    WriteResult,
+    Command, ComponentReport, HardwareMode, MemoryCommand, ReadResult, SharedWramState,
+    WramInitState, WramReport, WriteResult,
 };
 
 #[derive(Serialize, Deserialize)]
@@ -19,8 +19,7 @@ const WRAM_REPORT_INTERVAL: u64 = 4096;
 
 #[derive(Debug)]
 pub struct WramThread {
-    banks: Vec<Vec<u8>>,
-    selected_bank: u8,
+    shared: SharedWramState,
     hardware_mode: HardwareMode,
     steps: u64,
     last_reported_bank: u8,
@@ -51,6 +50,7 @@ impl WramThread {
                     Ok(Command::Memory(command)) => self.handle_memory(command),
                     Ok(Command::SetHardwareMode(hardware_mode)) => {
                         self.hardware_mode = hardware_mode;
+                        self.shared.set_hardware_mode(hardware_mode);
                     }
                     Ok(Command::SaveState(respond_to)) => {
                         let state = self.create_save_state();
@@ -78,16 +78,17 @@ impl WramThread {
                 break;
             }
 
+            let selected_bank = self.shared.selected_bank();
             self.steps += 1;
             if self.steps == 1
                 || self.steps % WRAM_REPORT_INTERVAL == 0
-                || self.selected_bank != self.last_reported_bank
+                || selected_bank != self.last_reported_bank
             {
                 let _ = reports.send(ComponentReport::Wram(WramReport {
                     steps: self.steps,
-                    selected_bank: self.selected_bank,
+                    selected_bank,
                 }));
-                self.last_reported_bank = self.selected_bank;
+                self.last_reported_bank = selected_bank;
             }
             thread::yield_now();
         }
@@ -99,16 +100,11 @@ impl WramThread {
                 address,
                 respond_to,
             } => {
-                let result = match address {
-                    0xff70 if matches!(self.hardware_mode, HardwareMode::DmgCompatibility) => {
-                        ReadResult::Ready(0xff)
-                    }
-                    0xff70 => ReadResult::Ready(0xf8 | self.selected_bank),
-                    _ => self
-                        .translate(address)
-                        .map(|(bank, offset)| ReadResult::Ready(self.banks[bank][offset]))
-                        .unwrap_or(ReadResult::NoData),
-                };
+                let result = self
+                    .shared
+                    .read(address)
+                    .map(ReadResult::Ready)
+                    .unwrap_or(ReadResult::NoData);
                 let _ = respond_to.send(result);
             }
             MemoryCommand::Write {
@@ -116,21 +112,10 @@ impl WramThread {
                 value,
                 respond_to,
             } => {
-                let result = match address {
-                    0xff70 if matches!(self.hardware_mode, HardwareMode::DmgCompatibility) => {
-                        WriteResult::Accepted
-                    }
-                    0xff70 => {
-                        self.selected_bank = select_wram_bank(value);
-                        WriteResult::Accepted
-                    }
-                    _ => match self.translate(address) {
-                        Some((bank, offset)) => {
-                            self.banks[bank][offset] = value;
-                            WriteResult::Accepted
-                        }
-                        None => WriteResult::NoData,
-                    },
+                let result = if self.shared.write(address, value) {
+                    WriteResult::Accepted
+                } else {
+                    WriteResult::NoData
                 };
                 if let Some(respond_to) = respond_to {
                     let _ = respond_to.send(result);
@@ -139,21 +124,18 @@ impl WramThread {
         }
     }
 
-    fn translate(&self, address: u16) -> Option<(usize, usize)> {
-        match address {
-            0xc000..=0xcfff => Some((0, (address - 0xc000) as usize)),
-            0xd000..=0xdfff => Some((self.selected_bank as usize, (address - 0xd000) as usize)),
-            0xe000..=0xefff => Some((0, (address - 0xe000) as usize)),
-            0xf000..=0xfdff => Some((self.selected_bank as usize, (address - 0xf000) as usize)),
-            _ => None,
-        }
-    }
-
     fn from_init_state(init_state: WramInitState) -> Self {
-        let selected_bank = select_wram_bank(init_state.selected_bank);
+        let shared = init_state.shared.unwrap_or_else(|| {
+            SharedWramState::new(
+                init_state.banks,
+                super::component::select_wram_bank(init_state.selected_bank),
+                init_state.hardware_mode,
+            )
+        });
+        shared.set_hardware_mode(init_state.hardware_mode);
+        let selected_bank = shared.selected_bank();
         Self {
-            banks: init_state.banks,
-            selected_bank,
+            shared,
             hardware_mode: init_state.hardware_mode,
             steps: 0,
             last_reported_bank: selected_bank,
@@ -162,28 +144,22 @@ impl WramThread {
 
     fn create_save_state(&self) -> WramSaveState {
         WramSaveState {
-            banks: self.banks.clone(),
-            selected_bank: self.selected_bank,
+            banks: self.shared.snapshot_banks(),
+            selected_bank: self.shared.selected_bank(),
             hardware_mode: self.hardware_mode,
         }
     }
 
     fn apply_save_state(&mut self, state: WramSaveState) {
-        self.banks = state.banks;
-        self.selected_bank = state.selected_bank;
+        self.shared.restore_banks(&state.banks);
+        self.shared.set_selected_bank(super::component::select_wram_bank(state.selected_bank));
         self.hardware_mode = state.hardware_mode;
+        self.shared.set_hardware_mode(state.hardware_mode);
     }
 }
 
 impl Default for WramThread {
     fn default() -> Self {
         Self::from_init_state(WramInitState::default())
-    }
-}
-
-fn select_wram_bank(value: u8) -> u8 {
-    match value & 0x07 {
-        0 => 1,
-        selected => selected,
     }
 }

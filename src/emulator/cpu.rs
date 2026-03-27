@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use super::bus::Bus;
 use super::component::{
     Command, ComponentReport, CpuInitState, CpuRegisters, CpuReport, HardwareMode, InterruptFlags,
-    MasterClock, MemoryCommand, ReadResult, SharedCartridgeReadState, WriteResult,
+    MasterClock, MemoryCommand, ReadResult, SharedApuState, SharedCartridgeRamState,
+    SharedCartridgeReadState, SharedPpuState, SharedTimerState, SharedWramState, WriteResult,
     IO_REGISTERS_LEN, HRAM_LEN,
 };
 use crate::input::JoypadState;
@@ -102,6 +103,11 @@ pub struct CpuThread {
     ime_enable_delay: u8,
     boot_rom_unmapped: bool,
     shared_cartridge: Option<SharedCartridgeReadState>,
+    shared_cartridge_ram: Option<SharedCartridgeRamState>,
+    shared_wram: Option<SharedWramState>,
+    shared_timer: Option<SharedTimerState>,
+    shared_apu: Option<SharedApuState>,
+    shared_ppu: Option<SharedPpuState>,
     joypad: JoypadState,
     last_joypad: u8,
     double_speed: bool,
@@ -150,11 +156,11 @@ impl CpuThread {
                 break;
             }
 
-            if self.paused.load(Ordering::Relaxed) {
+            if self.paused.load(Ordering::Acquire) {
                 self.service_inbox(&inbox);
                 thread::yield_now();
                 // Backdate epoch on resume so wall_target matches current cycles.
-                let speed = self.speed.load(Ordering::Relaxed).max(1) as u128;
+                let speed = self.speed.load(Ordering::Acquire).max(1) as u128;
                 let elapsed_nanos = (self.cycles as u128 * 100_000_000_000)
                     / (super::component::CPU_CLOCK_HZ as u128 * speed);
                 self.pacing_epoch = Some(
@@ -163,7 +169,7 @@ impl CpuThread {
                 continue;
             }
 
-            let speed = self.speed.load(Ordering::Relaxed);
+            let speed = self.speed.load(Ordering::Acquire);
             let should_run = if speed == 0 {
                 true // Uncapped: no wall-clock pacing.
             } else {
@@ -754,7 +760,7 @@ impl CpuThread {
         // Backdate the pacing epoch so wall_target matches self.cycles right now.
         // Must account for the speed multiplier — at 2x speed, the same number
         // of cycles corresponds to half the wall-clock time.
-        let speed = self.speed.load(Ordering::Relaxed).max(1) as u128;
+        let speed = self.speed.load(Ordering::Acquire).max(1) as u128;
         let elapsed_nanos = (self.cycles as u128 * 100_000_000_000)
             / (super::component::CPU_CLOCK_HZ as u128 * speed);
         self.pacing_epoch = Some(Instant::now() - std::time::Duration::from_nanos(elapsed_nanos as u64));
@@ -772,6 +778,60 @@ impl CpuThread {
                 self.cycles += 4;
                 self.clock.advance(self.cycles);
                 return value;
+            }
+        }
+
+        if let Some(shared_ram) = &self.shared_cartridge_ram {
+            if matches!(address, 0xa000..=0xbfff) {
+                if let Some(value) = shared_ram.read(address) {
+                    self.cycles += 4;
+                    self.clock.advance(self.cycles);
+                    return value;
+                }
+                // Exotic MBC — fall through to channel
+            }
+        }
+
+        if let Some(shared_wram) = &self.shared_wram {
+            if let Some(value) = shared_wram.read(address) {
+                self.cycles += 4;
+                self.clock.advance(self.cycles);
+                return value;
+            }
+        }
+
+        if let Some(shared_timer) = &self.shared_timer {
+            if matches!(address, 0xff04..=0xff07) {
+                // Advance clock first so the timer sees the current target.
+                self.cycles += 4;
+                self.clock.advance(self.cycles);
+                // Spin until the timer thread has caught up to our clock position.
+                while shared_timer.cycles.load(std::sync::atomic::Ordering::Acquire) < self.cycles {
+                    std::hint::spin_loop();
+                }
+                return shared_timer.read(address).unwrap_or(0xff);
+            }
+        }
+
+        if let Some(shared_apu) = &self.shared_apu {
+            if matches!(address, 0xff10..=0xff3f) {
+                if let Some(value) = shared_apu.read(address) {
+                    self.cycles += 4;
+                    self.clock.advance(self.cycles);
+                    return value;
+                }
+                // Wave RAM with CH3 enabled — fall through to channel
+            }
+        }
+
+        if let Some(shared_ppu) = &self.shared_ppu {
+            if let Some(result) = shared_ppu.read(address) {
+                self.cycles += 4;
+                self.clock.advance(self.cycles);
+                return match result {
+                    ReadResult::Ready(value) => value,
+                    ReadResult::NoData => 0xff,
+                };
             }
         }
 
@@ -809,6 +869,30 @@ impl CpuThread {
             self.cycles += 4;
             self.clock.advance(self.cycles);
             return;
+        }
+
+        if let Some(shared_ram) = &self.shared_cartridge_ram {
+            if matches!(address, 0xa000..=0xbfff) && shared_ram.write(address, value) {
+                self.cycles += 4;
+                self.clock.advance(self.cycles);
+                return;
+            }
+        }
+
+        if let Some(shared_wram) = &self.shared_wram {
+            if shared_wram.write(address, value) {
+                self.cycles += 4;
+                self.clock.advance(self.cycles);
+                return;
+            }
+        }
+
+        if let Some(shared_ppu) = &self.shared_ppu {
+            if shared_ppu.write(address, value) {
+                self.cycles += 4;
+                self.clock.advance(self.cycles);
+                return;
+            }
         }
 
         let mut pending = self.bus.write(address, value);
@@ -1323,6 +1407,11 @@ impl CpuThread {
             ime_enable_delay: 0,
             boot_rom_unmapped: false,
             shared_cartridge: init_state.shared_cartridge,
+            shared_cartridge_ram: init_state.shared_cartridge_ram,
+            shared_wram: init_state.shared_wram,
+            shared_timer: init_state.shared_timer,
+            shared_apu: init_state.shared_apu,
+            shared_ppu: init_state.shared_ppu,
             joypad: init_state.joypad,
             last_joypad: 0x0f,
             double_speed: false,

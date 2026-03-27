@@ -108,6 +108,27 @@ impl CartridgeController {
         }
     }
 
+    /// Whether RAM access at 0xA000-0xBFFF uses the standard read/write_ram_bank
+    /// pattern (ram_enabled + bank select + flat array).  When false, the MBC has
+    /// exotic RAM handling (RTC, EEPROM, IR, etc.) that requires the channel path.
+    pub(super) fn uses_standard_ram(&self) -> bool {
+        matches!(
+            self,
+            Self::RomOnly | Self::Mbc1(_) | Self::Mbc5(_) | Self::Mmm01(_)
+        )
+    }
+
+    pub(super) fn ram_enabled(&self) -> bool {
+        match self {
+            Self::RomOnly => true,
+            Self::Mbc1(state) => state.ram_enabled,
+            Self::Mbc5(state) => state.ram_enabled,
+            Self::Mmm01(state) => state.ram_enabled,
+            // Exotic types: not applicable for direct access.
+            _ => false,
+        }
+    }
+
     pub(super) fn selected_ram_bank(&self, metadata: &CartridgeMetadata) -> usize {
         match self {
             Self::RomOnly => 0.min(metadata.ram_bank_count.saturating_sub(1)),
