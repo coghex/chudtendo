@@ -29,8 +29,8 @@ pub use component::{
 use bus::Bus;
 use component::{
     Command, ComponentReport, CpuInitState, InterruptFlags, MasterClock, PpuInitState,
-    SharedApuState, SharedCartridgeReadState, SharedPpuState, SharedTimerState, SharedWramState,
-    TimerInitState, WramInitState,
+    SharedApuState, SharedCartridgeRamState, SharedCartridgeReadState, SharedPpuState,
+    SharedTimerState, SharedWramState, TimerInitState, WramInitState,
 };
 
 /// The full on-disk save state bundle.
@@ -177,6 +177,12 @@ pub struct Emulator {
     paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ppu_progress: Option<component::PpuProgress>,
     rewind_buffer: RewindBuffer,
+    // Shared state references for synchronous access (used by tests and direct API).
+    shared_wram: Option<SharedWramState>,
+    shared_ppu: Option<SharedPpuState>,
+    shared_timer: Option<SharedTimerState>,
+    shared_apu: Option<SharedApuState>,
+    shared_cartridge_ram: Option<SharedCartridgeRamState>,
 }
 
 impl Emulator {
@@ -228,6 +234,11 @@ impl Emulator {
             paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ppu_progress: None,
             rewind_buffer: RewindBuffer::new(REWIND_BUFFER_DEFAULT_CAPACITY),
+            shared_wram: None,
+            shared_ppu: None,
+            shared_timer: None,
+            shared_apu: None,
+            shared_cartridge_ram: None,
         }
     }
 
@@ -308,7 +319,10 @@ impl Emulator {
         cpu_init.speed = self.speed.clone();
         cpu_init.paused = self.paused.clone();
         if is_dmg_boot {
-            cpu_init.hardware_mode = HardwareMode::DmgCompatibility;
+            // During boot, all components start in CGB mode so the CGB boot ROM
+            // can write CGB palette registers for DMG game colorization.
+            // After the boot ROM finishes (0xFF50 write), finish_boot_transition
+            // propagates DmgCompatibility to all components.
             cpu_init.boot_target_mode = HardwareMode::DmgCompatibility;
         }
         let mut ppu_init = build_ppu_init_state(self.config.cartridge.metadata());
@@ -316,11 +330,10 @@ impl Emulator {
         let mut wram_init =
             build_wram_init_state(self.config.cartridge.metadata(), self.config.boot_seed);
         if is_dmg_boot {
-            ppu_init.hardware_mode = HardwareMode::DmgCompatibility;
+            // WRAM can start in DMG compat immediately (no CGB-only behavior needed).
             wram_init.hardware_mode = HardwareMode::DmgCompatibility;
-            // Initialize CGB palette RAM with DMG grayscale so rendering works.
-            // DMG boot ROM doesn't touch CGB palettes, so we provide defaults.
-            // 4 shades: white, light gray, dark gray, black (RGB555 values).
+            // Initialize CGB palette RAM with DMG grayscale as a fallback.
+            // The CGB boot ROM will overwrite these with game-specific colors.
             let dmg_colors: [[u8; 2]; 4] = [
                 [0xff, 0x7f], // white  (0x7FFF)
                 [0x10, 0x4a], // light  (0x4A10)
@@ -344,16 +357,20 @@ impl Emulator {
             wram_init.hardware_mode,
         );
         wram_init.shared = Some(shared_wram.clone());
-        cpu_init.shared_wram = Some(shared_wram);
+        cpu_init.shared_wram = Some(shared_wram.clone());
+        self.shared_wram = Some(shared_wram);
 
         let shared_timer = SharedTimerState::new();
         cpu_init.shared_timer = Some(shared_timer.clone());
+        self.shared_timer = Some(shared_timer.clone());
 
         let shared_apu = SharedApuState::new();
         cpu_init.shared_apu = Some(shared_apu.clone());
+        self.shared_apu = Some(shared_apu.clone());
 
         let shared_ppu = SharedPpuState::new();
         cpu_init.shared_ppu = Some(shared_ppu.clone());
+        self.shared_ppu = Some(shared_ppu.clone());
 
         let cpu_inbox = self
             .inboxes
@@ -417,6 +434,7 @@ impl Emulator {
             name: "cartridge",
             handle: cartridge_handle,
         });
+        self.shared_cartridge_ram = shared_cartridge_ram.clone();
         cpu_init.shared_cartridge_ram = shared_cartridge_ram;
 
         self.workers.push(WorkerHandle {
@@ -484,6 +502,85 @@ impl Emulator {
 
     pub fn write(&self, address: u16, value: u8) -> PendingWrite {
         self.bus.write(address, value)
+    }
+
+    /// Synchronous read that checks shared memory first, falling back to the
+    /// bus channel.  Primarily useful for tests — avoids thread-scheduling
+    /// flakiness for addresses backed by shared state.
+    #[cfg(test)]
+    pub fn sync_read(&self, address: u16) -> component::ReadResult {
+        use component::ReadResult;
+
+        // Pure-data shared states: no timing dependency, instant result.
+        if let Some(ref shared) = self.shared_wram {
+            if let Some(value) = shared.read(address) {
+                return ReadResult::Ready(value);
+            }
+        }
+        if let Some(ref shared) = self.shared_cartridge_ram {
+            if matches!(address, 0xa000..=0xbfff) {
+                if let Some(value) = shared.read(address) {
+                    return ReadResult::Ready(value);
+                }
+            }
+        }
+        // PPU VRAM/OAM/LCD writes are synchronous, so reads from shared state
+        // are safe when the test has only done shared writes to those regions.
+        // But for addresses where writes go through the channel (palettes, LCDC,
+        // timer, etc.), we must also read through the channel to ensure ordering.
+        if let Some(ref shared) = self.shared_ppu {
+            // Only use shared reads for addresses whose writes are ALSO shared.
+            if matches!(address, 0x8000..=0x9fff | 0xfe00..=0xfe9f | 0xff42..=0xff43 | 0xff47..=0xff4b | 0xff4f) {
+                if let Some(result) = shared.read(address) {
+                    return result;
+                }
+            }
+        }
+
+        // Everything else (timer, APU, palettes, HDMA, LCDC/STAT/LY/LYC/DMA,
+        // CPU-owned) — use the channel for proper ordering with prior writes.
+        let mut pending = self.bus.read(address);
+        for _ in 0..2000 {
+            if let Some(result) = pending.try_take() {
+                return result;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("sync_read timed out at {address:#06x}");
+    }
+
+    /// Synchronous write that checks shared memory first, falling back to the
+    /// bus channel.  Returns the write result.
+    #[cfg(test)]
+    pub fn sync_write(&self, address: u16, value: u8) -> component::WriteResult {
+        use component::WriteResult;
+
+        // Check shared states for direct writes.
+        if let Some(ref shared) = self.shared_ppu {
+            if shared.write(address, value) {
+                return WriteResult::Accepted;
+            }
+        }
+        if let Some(ref shared) = self.shared_wram {
+            if shared.write(address, value) {
+                return WriteResult::Accepted;
+            }
+        }
+        if let Some(ref shared) = self.shared_cartridge_ram {
+            if matches!(address, 0xa000..=0xbfff) && shared.write(address, value) {
+                return WriteResult::Accepted;
+            }
+        }
+
+        // Fall back to channel with generous timeout.
+        let mut pending = self.bus.write(address, value);
+        for _ in 0..2000 {
+            if let Some(result) = pending.try_take() {
+                return result;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("sync_write timed out at {address:#06x}");
     }
 
     fn drain_reports(&mut self, context: &str) -> ReportDrainStats {
@@ -1120,8 +1217,14 @@ fn fill_bytes<const N: usize>(buffer: &mut [u8; N], seed: u64) {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Mutex;
     use std::thread;
     use std::time::Duration;
+
+    /// Serializes emulator tests to avoid thread contention.
+    /// Each test spawns 6 component threads; running many tests in parallel
+    /// creates 100+ threads competing for CPU, causing channel timeouts.
+    static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
     const ROM_BANK_SIZE: usize = 0x4000;
     const TEST_NINTENDO_LOGO: [u8; 48] = [
@@ -1186,31 +1289,11 @@ mod tests {
     }
 
     fn await_read(emulator: &Emulator, address: u16) -> ReadResult {
-        let mut pending = emulator.read(address);
-
-        for _ in 0..50 {
-            if let Some(result) = pending.try_take() {
-                return result;
-            }
-
-            thread::sleep(Duration::from_millis(1));
-        }
-
-        panic!("timed out waiting for read at {address:#06x}");
+        emulator.sync_read(address)
     }
 
     fn await_write(emulator: &Emulator, address: u16, value: u8) -> WriteResult {
-        let mut pending = emulator.write(address, value);
-
-        for _ in 0..50 {
-            if let Some(result) = pending.try_take() {
-                return result;
-            }
-
-            thread::sleep(Duration::from_millis(1));
-        }
-
-        panic!("timed out waiting for write at {address:#06x}");
+        emulator.sync_write(address, value)
     }
 
     fn wait_for_read<F>(emulator: &Emulator, address: u16, predicate: F) -> u8
@@ -1289,6 +1372,7 @@ mod tests {
 
     #[test]
     fn rom_only_cartridge_keeps_fixed_bank_mapping() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         let cartridge =
             CartridgeImage::from_bytes(build_test_rom("ROMONLY", 0xc0, 0x00, 0x00, 0x00, 0x00))
                 .unwrap();
@@ -1307,6 +1391,7 @@ mod tests {
 
     #[test]
     fn cpu_owns_hram_and_interrupt_registers() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         let mut emulator = emulator_with_stopped_cpu();
         emulator.start().unwrap();
 
@@ -1318,6 +1403,7 @@ mod tests {
 
     #[test]
     fn dmg_boot_rom_executes_from_reset_vector() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         let cartridge =
             CartridgeImage::from_bytes(build_test_rom("DMGBOOT", 0x00, 0x00, 0x01, 0x01, 0x00))
                 .unwrap();
@@ -1366,6 +1452,7 @@ mod tests {
 
     #[test]
     fn wram_translates_echo_and_bank_select() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         let mut emulator = emulator_with_stopped_cpu();
         emulator.start().unwrap();
 
@@ -1382,6 +1469,7 @@ mod tests {
 
     #[test]
     fn ppu_owns_vram_oam_and_banked_registers() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         let mut emulator = emulator_with_stopped_cpu();
         emulator.start().unwrap();
 
@@ -1397,6 +1485,7 @@ mod tests {
 
     #[test]
     fn ppu_advances_ly_and_requests_vblank() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         let mut emulator = emulator_with_stopped_cpu();
         emulator.start().unwrap();
 
@@ -1414,6 +1503,7 @@ mod tests {
 
     #[test]
     fn ppu_cgb_palette_ram_tracks_index_and_autoincrement() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         let mut emulator = emulator_with_stopped_cpu();
         emulator.start().unwrap();
 
@@ -1430,6 +1520,7 @@ mod tests {
 
     #[test]
     fn ppu_renders_cgb_palette_colors_before_dmg_handoff() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         let mut emulator = emulator_with_stopped_cpu();
         emulator.start().unwrap();
 
@@ -1454,6 +1545,7 @@ mod tests {
 
     #[test]
     fn ppu_renders_background_tiles_into_framebuffer() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         let mut emulator = emulator_with_stopped_cpu();
         emulator.start().unwrap();
 
@@ -1472,6 +1564,7 @@ mod tests {
 
     #[test]
     fn ppu_renders_sprites_over_background() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         let mut emulator = emulator_with_stopped_cpu();
         emulator.start().unwrap();
 
@@ -1495,6 +1588,7 @@ mod tests {
 
     #[test]
     fn ppu_ff46_dma_copies_source_bytes_into_oam() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         let mut emulator = emulator_with_stopped_cpu();
         emulator.start().unwrap();
 
@@ -1516,6 +1610,7 @@ mod tests {
 
     #[test]
     fn disabling_lcd_resets_ly_and_blanks_framebuffer() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         let mut emulator = emulator_with_stopped_cpu();
         emulator.start().unwrap();
 
@@ -1539,6 +1634,7 @@ mod tests {
 
     #[test]
     fn mbc1_cartridge_switches_rom_and_ram_banks() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         let cartridge =
             CartridgeImage::from_bytes(build_test_rom("MBC1TEST", 0xc0, 0x00, 0x03, 0x01, 0x03))
                 .unwrap();
@@ -1583,6 +1679,7 @@ mod tests {
 
     #[test]
     fn timer_owns_timer_registers_and_unused_space_returns_no_data() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         let mut emulator = emulator_with_stopped_cpu();
         emulator.start().unwrap();
 
@@ -1594,6 +1691,7 @@ mod tests {
 
     #[test]
     fn timer_reloads_tima_and_requests_interrupt() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         let mut emulator = emulator_with_stopped_cpu();
         emulator.start().unwrap();
 

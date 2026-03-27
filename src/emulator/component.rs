@@ -304,10 +304,10 @@ unsafe impl Sync for SharedCartridgeRam {}
 impl SharedCartridgeRam {
     fn new(data: Vec<u8>) -> Self { Self { data: std::cell::UnsafeCell::new(data) } }
     fn read(&self, index: usize) -> u8 {
-        unsafe { *self.data.get().cast::<u8>().add(index) }
+        unsafe { *(*self.data.get()).as_ptr().add(index) }
     }
     fn write(&self, index: usize, value: u8) {
-        unsafe { *self.data.get().cast::<u8>().add(index) = value }
+        unsafe { *(*self.data.get()).as_mut_ptr().add(index) = value }
     }
     fn as_slice(&self) -> &[u8] {
         unsafe {
