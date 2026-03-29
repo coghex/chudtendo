@@ -183,7 +183,7 @@ impl Mbc1State {
                 self.selected_ram_bank(metadata),
                 address - 0xa000,
             ),
-            0xa000..=0xbfff => ReadResult::NoData,
+            0xa000..=0xbfff => ReadResult::Ready(0xff),
             _ => ReadResult::NoData,
         }
     }
@@ -223,7 +223,7 @@ impl Mbc1State {
                 address - 0xa000,
                 value,
             ),
-            0xa000..=0xbfff => WriteResult::NoData,
+            0xa000..=0xbfff => WriteResult::Accepted,
             _ => WriteResult::NoData,
         }
     }
@@ -302,7 +302,7 @@ impl Mbc2State {
                 let index = (address as usize - 0xa000) & 0x1ff;
                 ReadResult::Ready(0xf0 | self.ram[index])
             }
-            0xa000..=0xbfff => ReadResult::NoData,
+            0xa000..=0xbfff => ReadResult::Ready(0xff),
             _ => ReadResult::NoData,
         }
     }
@@ -323,7 +323,7 @@ impl Mbc2State {
                 self.ram[index] = value & 0x0f;
                 WriteResult::Accepted
             }
-            0xa000..=0xbfff => WriteResult::NoData,
+            0xa000..=0xbfff => WriteResult::Accepted,
             _ => WriteResult::NoData,
         }
     }
@@ -380,7 +380,7 @@ impl Mbc3State {
             0x4000..=0x7fff => {
                 read_rom_bank(rom, metadata, self.selected_rom_bank(metadata), address - 0x4000)
             }
-            0xa000..=0xbfff if !self.ram_enabled => ReadResult::NoData,
+            0xa000..=0xbfff if !self.ram_enabled => ReadResult::Ready(0xff),
             0xa000..=0xbfff => match self.bank_select {
                 0x00..=0x07 => {
                     read_ram_bank(ram, metadata, self.bank_select as usize, address - 0xa000)
@@ -431,7 +431,7 @@ impl Mbc3State {
                 }
                 WriteResult::Accepted
             }
-            0xa000..=0xbfff if !self.ram_enabled => WriteResult::NoData,
+            0xa000..=0xbfff if !self.ram_enabled => WriteResult::Accepted,
             0xa000..=0xbfff => match self.bank_select {
                 0x00..=0x07 => {
                     write_ram_bank(ram, metadata, self.bank_select as usize, address - 0xa000, value)
@@ -470,7 +470,10 @@ impl Mbc3State {
         if metadata.ram_bank_count == 0 {
             return 0;
         }
-        (self.bank_select as usize).min(metadata.ram_bank_count - 1)
+        match self.bank_select {
+            0x00..=0x07 => (self.bank_select as usize) % metadata.ram_bank_count,
+            _ => 0,
+        }
     }
 }
 
@@ -586,7 +589,7 @@ impl Mbc5State {
             0xa000..=0xbfff if self.ram_enabled => {
                 read_ram_bank(ram, metadata, self.ram_bank as usize, address - 0xa000)
             }
-            0xa000..=0xbfff => ReadResult::NoData,
+            0xa000..=0xbfff => ReadResult::Ready(0xff),
             _ => ReadResult::NoData,
         }
     }
@@ -618,7 +621,7 @@ impl Mbc5State {
             0xa000..=0xbfff if self.ram_enabled => {
                 write_ram_bank(ram, metadata, self.ram_bank as usize, address - 0xa000, value)
             }
-            0xa000..=0xbfff => WriteResult::NoData,
+            0xa000..=0xbfff => WriteResult::Accepted,
             _ => WriteResult::NoData,
         }
     }
@@ -692,7 +695,7 @@ impl HuC1State {
                 self.selected_ram_bank(metadata),
                 address - 0xa000,
             ),
-            0xa000..=0xbfff => ReadResult::NoData,
+            0xa000..=0xbfff => ReadResult::Ready(0xff),
             _ => ReadResult::NoData,
         }
     }
@@ -742,7 +745,7 @@ impl HuC1State {
                 address - 0xa000,
                 value,
             ),
-            0xa000..=0xbfff => WriteResult::NoData,
+            0xa000..=0xbfff => WriteResult::Accepted,
             _ => WriteResult::NoData,
         }
     }
@@ -854,7 +857,7 @@ impl HuC3State {
                 0x0a => read_ram_bank(ram, metadata, self.ram_bank as usize, address - 0xa000),
                 0x0b => ReadResult::Ready(0x01 | (self.output << 1)),
                 0x0e => ReadResult::Ready(0xc1), // IR: bit 0 = 1 (no light)
-                _ => ReadResult::NoData,
+                _ => ReadResult::Ready(0xff),
             },
             _ => ReadResult::NoData,
         }
@@ -896,7 +899,7 @@ impl HuC3State {
                     WriteResult::Accepted
                 }
                 0x0e => WriteResult::Accepted, // IR write — no-op
-                _ => WriteResult::NoData,
+                _ => WriteResult::Accepted,
             },
             _ => WriteResult::NoData,
         }
@@ -1063,7 +1066,7 @@ impl Mbc7State {
                 };
                 ReadResult::Ready(value)
             }
-            0xa000..=0xbfff => ReadResult::NoData,
+            0xa000..=0xbfff => ReadResult::Ready(0xff),
             _ => ReadResult::NoData,
         }
     }
@@ -1115,7 +1118,7 @@ impl Mbc7State {
                 }
                 WriteResult::Accepted
             }
-            0xa000..=0xbfff => WriteResult::NoData,
+            0xa000..=0xbfff => WriteResult::Accepted,
             _ => WriteResult::NoData,
         }
     }
@@ -1451,7 +1454,7 @@ impl Mmm01State {
             0xa000..=0xbfff if self.ram_enabled => {
                 read_ram_bank(ram, metadata, self.selected_ram_bank(metadata), address - 0xa000)
             }
-            0xa000..=0xbfff => ReadResult::NoData,
+            0xa000..=0xbfff => ReadResult::Ready(0xff),
             _ => ReadResult::NoData,
         }
     }
@@ -1516,7 +1519,7 @@ impl Mmm01State {
                     value,
                 )
             }
-            0xa000..=0xbfff => WriteResult::NoData,
+            0xa000..=0xbfff => WriteResult::Accepted,
             _ => WriteResult::NoData,
         }
     }
@@ -1659,7 +1662,7 @@ impl Mbc6State {
                 if offset < ram.len() {
                     ReadResult::Ready(ram[offset])
                 } else {
-                    ReadResult::NoData
+                    ReadResult::Ready(0xff)
                 }
             }
             0xb000..=0xbfff if self.ram_enabled => {
@@ -1668,10 +1671,10 @@ impl Mbc6State {
                 if offset < ram.len() {
                     ReadResult::Ready(ram[offset])
                 } else {
-                    ReadResult::NoData
+                    ReadResult::Ready(0xff)
                 }
             }
-            0xa000..=0xbfff => ReadResult::NoData,
+            0xa000..=0xbfff => ReadResult::Ready(0xff),
             _ => ReadResult::NoData,
         }
     }
@@ -1753,7 +1756,7 @@ impl Mbc6State {
                 }
                 WriteResult::Accepted
             }
-            0xa000..=0xbfff => WriteResult::NoData,
+            0xa000..=0xbfff => WriteResult::Accepted,
             _ => WriteResult::NoData,
         }
     }
@@ -1897,7 +1900,7 @@ impl PocketCameraState {
             0xa000..=0xbfff if self.ram_enabled => {
                 read_ram_bank(ram, metadata, self.ram_bank as usize, address - 0xa000)
             }
-            0xa000..=0xbfff => ReadResult::NoData,
+            0xa000..=0xbfff => ReadResult::Ready(0xff),
             _ => ReadResult::NoData,
         }
     }
@@ -1944,7 +1947,7 @@ impl PocketCameraState {
             0xa000..=0xbfff if self.ram_enabled => {
                 write_ram_bank(ram, metadata, self.ram_bank as usize, address - 0xa000, value)
             }
-            0xa000..=0xbfff => WriteResult::NoData,
+            0xa000..=0xbfff => WriteResult::Accepted,
             _ => WriteResult::NoData,
         }
     }

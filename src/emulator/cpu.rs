@@ -26,6 +26,7 @@ pub struct CpuSaveState {
     pub io_registers: Vec<u8>,
     pub hram: Vec<u8>,
     pub interrupt_enable: u8,
+    pub interrupt_flags: u8,
     pub interrupt_master_enable: bool,
     pub ime_enable_delay: u8,
     pub double_speed: bool,
@@ -708,6 +709,7 @@ impl CpuThread {
             io_registers: self.io_registers.to_vec(),
             hram: self.hram.to_vec(),
             interrupt_enable: self.interrupt_enable,
+            interrupt_flags: self.interrupt_flags.load(),
             interrupt_master_enable: self.interrupt_master_enable,
             ime_enable_delay: self.ime_enable_delay,
             double_speed: self.double_speed,
@@ -735,6 +737,7 @@ impl CpuThread {
         let len = state.hram.len().min(HRAM_LEN);
         self.hram[..len].copy_from_slice(&state.hram[..len]);
         self.interrupt_enable = state.interrupt_enable;
+        self.interrupt_flags.store(state.interrupt_flags);
         self.interrupt_master_enable = state.interrupt_master_enable;
         self.ime_enable_delay = state.ime_enable_delay;
         self.double_speed = state.double_speed;
@@ -856,6 +859,8 @@ impl CpuThread {
 
     fn write_byte(&mut self, inbox: &Receiver<Command>, address: u16, value: u8) {
         if self.write_cpu_owned(address, value) {
+            self.cycles += 4;
+            self.clock.advance(self.cycles);
             return;
         }
 

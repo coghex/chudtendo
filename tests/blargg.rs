@@ -118,9 +118,10 @@ fn collect_serial_output(serial_rx: &Receiver<u8>, emulator: &mut Emulator) -> T
         }
 
         // Check SRAM result byte: $A000 != $80 means test finished.
+        // $FF is open-bus (disabled or absent SRAM) — ignore it.
         if !output.is_empty() {
             if let Some(result) = read_sram_result(emulator) {
-                if result != 0x80 {
+                if result != 0x80 && result != 0xff {
                     // Re-read full output one last time.
                     if let Some(final_output) = read_sram_output(emulator) {
                         output = final_output;

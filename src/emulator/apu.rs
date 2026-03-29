@@ -1,4 +1,6 @@
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering as AtomicOrdering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError};
+use std::sync::Arc;
 use std::thread;
 
 use serde::{Deserialize, Serialize};
@@ -143,6 +145,11 @@ pub struct ApuThread {
     sample_counter: u32,
     samples_emitted: u64,
     sample_sender: SyncSender<[f32; 2]>,
+    /// Dynamic sample rate (Hz), adjusted by the SDL audio callback's
+    /// adaptive rate control loop to keep the producer and consumer in sync.
+    sample_rate: Arc<AtomicU32>,
+    /// Approximate fill level of the audio channel — shared with the callback.
+    audio_fill_level: Arc<AtomicI32>,
     /// First-order high-pass filter state (capacitor coupling).
     /// Removes DC offset, matching the Game Boy's analog output stage.
     hpf_left: f32,
@@ -210,18 +217,26 @@ impl ApuThread {
         clock: MasterClock,
         hardware_mode: super::component::HardwareMode,
         shared: SharedApuState,
+        sample_rate: Arc<AtomicU32>,
+        audio_fill_level: Arc<AtomicI32>,
     ) -> thread::JoinHandle<()> {
         thread::Builder::new()
             .name("apu".to_owned())
             .spawn(move || {
-                let mut apu = Self::new(sample_sender, clock.clone(), shared);
+                let mut apu = Self::new(sample_sender, clock.clone(), shared, sample_rate, audio_fill_level);
                 apu.hardware_mode = hardware_mode;
                 apu.run(inbox, reports, clock)
             })
             .expect("failed to spawn apu thread")
     }
 
-    fn new(sample_sender: SyncSender<[f32; 2]>, clock: MasterClock, shared: SharedApuState) -> Self {
+    fn new(
+        sample_sender: SyncSender<[f32; 2]>,
+        clock: MasterClock,
+        shared: SharedApuState,
+        sample_rate: Arc<AtomicU32>,
+        audio_fill_level: Arc<AtomicI32>,
+    ) -> Self {
         Self {
             clock,
             cycles: 0,
@@ -241,6 +256,8 @@ impl ApuThread {
             sample_counter: 0,
             samples_emitted: 0,
             sample_sender,
+            sample_rate,
+            audio_fill_level,
             hpf_left: 0.0,
             hpf_right: 0.0,
         }
@@ -1041,7 +1058,8 @@ impl ApuThread {
         // Noise channel: ticks at variable rate via period timer.
         self.channel4.tick_period();
 
-        self.sample_counter += SAMPLE_RATE;
+        let rate = self.sample_rate.load(AtomicOrdering::Relaxed);
+        self.sample_counter += rate;
         if self.sample_counter >= CPU_CLOCK {
             self.sample_counter -= CPU_CLOCK;
             self.emit_sample();
@@ -1151,7 +1169,9 @@ impl ApuThread {
         self.hpf_right += hpf_right_out * HPF_DECAY;
 
         self.samples_emitted += 1;
-        let _ = self.sample_sender.try_send([hpf_left_out, hpf_right_out]);
+        if self.sample_sender.try_send([hpf_left_out, hpf_right_out]).is_ok() {
+            self.audio_fill_level.fetch_add(1, AtomicOrdering::Relaxed);
+        }
     }
 }
 

@@ -1,4 +1,6 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering as AtomicOrdering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sdl2::audio::{AudioCallback, AudioSpecDesired};
@@ -784,6 +786,10 @@ fn trace_display_pacing(refresh_rate: i32, ppu_delay: Option<Duration>) {
 
 struct AudioOutput {
     receiver: std::sync::mpsc::Receiver<[f32; 2]>,
+    fill_level: Arc<AtomicI32>,
+    sample_rate: Arc<AtomicU32>,
+    base_rate: u32,
+    last_sample: [f32; 2],
 }
 
 impl AudioCallback for AudioOutput {
@@ -791,14 +797,38 @@ impl AudioCallback for AudioOutput {
 
     fn callback(&mut self, out: &mut [f32]) {
         for chunk in out.chunks_exact_mut(2) {
-            if let Ok(sample) = self.receiver.try_recv() {
-                chunk[0] = sample[0];
-                chunk[1] = sample[1];
-            } else {
-                chunk[0] = 0.0;
-                chunk[1] = 0.0;
+            match self.receiver.try_recv() {
+                Ok(sample) => {
+                    chunk[0] = sample[0];
+                    chunk[1] = sample[1];
+                    self.last_sample = sample;
+                    self.fill_level.fetch_sub(1, AtomicOrdering::Relaxed);
+                }
+                Err(_) => {
+                    // Repeat last sample on underflow — far less audible than
+                    // hard silence, and the HPF naturally decays it to zero.
+                    chunk[0] = self.last_sample[0];
+                    chunk[1] = self.last_sample[1];
+                }
             }
         }
+
+        // Adaptive rate control: nudge the APU's sample rate to keep the
+        // channel buffer near 50% full, absorbing clock drift between the
+        // emulation clock and the real-time audio hardware clock.
+        let target_fill = crate::emulator::AUDIO_BUFFER_CAPACITY as i32 / 2;
+        let current_fill = self.fill_level.load(AtomicOrdering::Relaxed);
+        let error = current_fill - target_fill;
+
+        // Proportional adjustment capped at +/- 2% of the base rate.
+        // Positive error (buffer too full) → lower APU rate → fewer samples.
+        // Negative error (buffer too empty) → raise APU rate → more samples.
+        let max_adjust = (self.base_rate as f32 * 0.02) as i32;
+        let adjustment = ((error as f64 / target_fill as f64) * max_adjust as f64) as i32;
+        let new_rate = (self.base_rate as i32 - adjustment)
+            .clamp(self.base_rate as i32 - max_adjust, self.base_rate as i32 + max_adjust)
+            as u32;
+        self.sample_rate.store(new_rate, AtomicOrdering::Relaxed);
     }
 }
 
@@ -820,8 +850,21 @@ fn init_audio(
         samples: Some(1024),
     };
 
+    let sample_rate = emulator.sample_rate_shared();
+    let fill_level = emulator.audio_fill_level_shared();
+
     let device = audio
-        .open_playback(None, &desired, |_spec| AudioOutput { receiver })
+        .open_playback(None, &desired, |spec| {
+            let base_rate = spec.freq as u32;
+            sample_rate.store(base_rate, AtomicOrdering::Relaxed);
+            AudioOutput {
+                receiver,
+                fill_level,
+                sample_rate,
+                base_rate,
+                last_sample: [0.0; 2],
+            }
+        })
         .map_err(|error| format!("failed to open audio device: {error}"))?;
 
     device.resume();

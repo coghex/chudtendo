@@ -347,6 +347,7 @@ impl PpuThread {
         self.hardware_mode = state.hardware_mode;
         self.shared.set_hardware_mode(state.hardware_mode);
         self.shared.set_lcd_enabled(self.lcd_enabled());
+        self.update_stat_mode();
         // Transient rendering data
         self.oam_dma = None;
         self.shared.set_oam_dma_active(false);
@@ -506,18 +507,7 @@ impl PpuThread {
                         WriteResult::Accepted
                     }
                     0xff44 => {
-                        self.set_lcd_reg(LY_INDEX, 0);
-                        self.dots_into_line = 0;
-                        trace_ppu_memory_write(
-                            self.frames,
-                            address,
-                            value,
-                            self.lcd_reg(LY_INDEX),
-                            self.dots_into_line,
-                            self.current_mode(),
-                            "reg",
-                        );
-                        self.update_stat_mode();
+                        // LY is read-only; writes are silently ignored.
                         WriteResult::Accepted
                     }
                     0xff45 => {
@@ -600,7 +590,7 @@ impl PpuThread {
                         WriteResult::Accepted
                     }
                     0xff68 => {
-                        self.bg_palette_index = sanitize_palette_index(value);
+                        self.bg_palette_index = value;
                         self.shared.set_bg_palette_index(self.bg_palette_index);
                         trace_ppu_memory_write(
                             self.frames,
@@ -630,7 +620,7 @@ impl PpuThread {
                         WriteResult::Accepted
                     }
                     0xff6a => {
-                        self.obj_palette_index = sanitize_palette_index(value);
+                        self.obj_palette_index = value;
                         self.shared.set_obj_palette_index(self.obj_palette_index);
                         trace_ppu_memory_write(
                             self.frames,
@@ -697,8 +687,8 @@ impl PpuThread {
             shared,
             selected_vram_bank: init_state.selected_vram_bank,
             hdma_registers: init_state.hdma_registers,
-            bg_palette_index: sanitize_palette_index(init_state.bg_palette_index),
-            obj_palette_index: sanitize_palette_index(init_state.obj_palette_index),
+            bg_palette_index: init_state.bg_palette_index,
+            obj_palette_index: init_state.obj_palette_index,
             bg_palette_ram: init_state.bg_palette_ram,
             obj_palette_ram: init_state.obj_palette_ram,
             framebuffer: init_state.framebuffer,
@@ -771,10 +761,16 @@ impl PpuThread {
 
         self.dots_into_line += 1;
 
-        if self.dots_into_line == MODE2_DOTS + MODE3_DOTS {
+        if self.dots_into_line == MODE2_DOTS {
             let line = self.lcd_reg(LY_INDEX);
             if line < VISIBLE_LINES {
                 self.scanline_registers[line as usize] = self.capture_scanline_registers();
+            }
+        }
+
+        if self.dots_into_line == MODE2_DOTS + MODE3_DOTS {
+            let line = self.lcd_reg(LY_INDEX);
+            if line < VISIBLE_LINES {
                 self.render_scanline(line as usize);
                 self.advance_hblank_dma();
             }
@@ -876,7 +872,8 @@ impl PpuThread {
         let coincidence = stat & STAT_LYC_FLAG_MASK != 0;
         let mode0 = mode == 0 && stat & STAT_MODE0_INTERRUPT_MASK != 0;
         let mode1 = mode == 1 && stat & STAT_MODE1_INTERRUPT_MASK != 0;
-        let mode2 = mode == 2 && stat & STAT_MODE2_INTERRUPT_MASK != 0;
+        let mode2 = stat & STAT_MODE2_INTERRUPT_MASK != 0
+            && (mode == 2 || (mode == 1 && self.lcd_reg(LY_INDEX) == VISIBLE_LINES));
         let lyc = coincidence && stat & STAT_LYC_INTERRUPT_MASK != 0;
         let interrupt_line = mode0 || mode1 || mode2 || lyc;
 
@@ -1165,11 +1162,13 @@ impl PpuThread {
             return;
         }
 
+        let saved_window_line = self.window_line;
         self.window_line = 0;
         self.snapshot_vram_for_rendering();
         for y in 0..SCREEN_HEIGHT {
             self.render_scanline(y);
         }
+        self.window_line = saved_window_line;
     }
 
     fn fill_framebuffer(&mut self, rgba: [u8; 4]) {
@@ -1505,10 +1504,6 @@ impl PpuThread {
 
 fn map_palette(color_index: u8, palette: u8) -> u8 {
     (palette >> (color_index * 2)) & 0x03
-}
-
-fn sanitize_palette_index(value: u8) -> u8 {
-    value & 0xbf
 }
 
 fn cgb_palette_color(palette_ram: &[u8; PALETTE_RAM_LEN], palette: u8, color_index: u8) -> [u8; 4] {

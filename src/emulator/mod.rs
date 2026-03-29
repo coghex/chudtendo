@@ -8,9 +8,16 @@ mod timer;
 mod wram;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI32, AtomicU32};
 use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Size of the bounded audio sample channel (in stereo sample pairs).
+/// ~85 ms of audio at 48 kHz — large enough for the adaptive rate control
+/// loop to absorb transient scheduling jitter without overflow or underflow.
+pub(crate) const AUDIO_BUFFER_CAPACITY: usize = 4096;
 
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
@@ -183,6 +190,13 @@ pub struct Emulator {
     shared_timer: Option<SharedTimerState>,
     shared_apu: Option<SharedApuState>,
     shared_cartridge_ram: Option<SharedCartridgeRamState>,
+    /// Shared sample rate (Hz) — written by the SDL audio callback after
+    /// negotiating the actual device rate, read by the APU thread each tick.
+    sample_rate: Arc<AtomicU32>,
+    /// Approximate number of stereo samples currently in the audio channel.
+    /// Incremented by the APU on successful send, decremented by the SDL
+    /// callback on successful receive. Used by the adaptive rate control loop.
+    audio_fill_level: Arc<AtomicI32>,
 }
 
 impl Emulator {
@@ -198,7 +212,7 @@ impl Emulator {
         let (timer_sender, timer_receiver) = mpsc::channel();
         let (apu_sender, apu_receiver) = mpsc::channel();
         let (_report_sender, report_receiver) = mpsc::channel();
-        let (sample_sender, sample_receiver) = mpsc::sync_channel(2048);
+        let (sample_sender, sample_receiver) = mpsc::sync_channel(AUDIO_BUFFER_CAPACITY);
         let (serial_out_sender, serial_out_receiver) = mpsc::sync_channel(4096);
 
         Self {
@@ -239,6 +253,8 @@ impl Emulator {
             shared_timer: None,
             shared_apu: None,
             shared_cartridge_ram: None,
+            sample_rate: Arc::new(AtomicU32::new(48_000)),
+            audio_fill_level: Arc::new(AtomicI32::new(0)),
         }
     }
 
@@ -270,7 +286,20 @@ impl Emulator {
     }
 
     pub fn take_sample_receiver(&mut self) -> Option<Receiver<[f32; 2]>> {
+        self.audio_fill_level.store(0, std::sync::atomic::Ordering::Relaxed);
         self.sample_ready.take()
+    }
+
+    pub fn sample_rate_shared(&self) -> Arc<AtomicU32> {
+        self.sample_rate.clone()
+    }
+
+    pub fn audio_fill_level_shared(&self) -> Arc<AtomicI32> {
+        self.audio_fill_level.clone()
+    }
+
+    pub fn set_sample_rate(&self, rate: u32) {
+        self.sample_rate.store(rate, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn take_serial_receiver(&mut self) -> Option<Receiver<u8>> {
@@ -490,6 +519,8 @@ impl Emulator {
                     HardwareMode::Cgb
                 },
                 shared_apu,
+                self.sample_rate.clone(),
+                self.audio_fill_level.clone(),
             ),
         });
 
@@ -805,8 +836,12 @@ impl Emulator {
             .state_path(slot)
             .ok_or_else(|| "no ROM path configured; cannot determine save state path".to_owned())?;
 
-        let full = self.capture_state()?;
+        self.pause();
+        thread::sleep(Duration::from_millis(1));
+        let result = self.capture_state();
+        self.resume();
 
+        let full = result?;
         let bytes =
             bincode::serialize(&full).map_err(|e| format!("failed to serialize save state: {e}"))?;
         std::fs::write(&path, &bytes)
@@ -825,7 +860,10 @@ impl Emulator {
         let full: FullSaveState = bincode::deserialize(&bytes)
             .map_err(|e| format!("failed to deserialize save state: {e}"))?;
 
+        self.pause();
+        thread::sleep(Duration::from_millis(1));
         self.restore_state(&full);
+        self.resume();
 
         Ok(())
     }
@@ -868,7 +906,10 @@ impl Emulator {
     /// Returns the framebuffer to display, or `None` if the buffer is empty.
     pub fn rewind_step(&mut self) -> Option<Vec<u8>> {
         let snapshot = self.rewind_buffer.pop()?;
+        self.pause();
+        thread::sleep(Duration::from_millis(1));
         self.restore_state(&snapshot.state);
+        self.resume();
         Some(snapshot.framebuffer)
     }
 
@@ -1710,5 +1751,40 @@ mod tests {
             other => panic!("expected Ready, got {other:?}"),
         }
         assert_eq!(interrupt_flags & 0x04, 0x04);
+    }
+
+    #[test]
+    fn save_load_state_preserves_interrupt_flags() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let mut emulator = emulator_with_stopped_cpu();
+        emulator.start().unwrap();
+
+        // Enable LCD so the PPU sets the VBlank interrupt flag (bit 0).
+        assert_eq!(await_write(&emulator, 0xff40, 0x91), WriteResult::Accepted);
+        let _ = wait_for_read(&emulator, 0xff0f, |v| v & 0x01 != 0);
+
+        // Capture the current IF value.
+        let if_before = match await_read(&emulator, 0xff0f) {
+            ReadResult::Ready(v) => v,
+            other => panic!("expected Ready, got {other:?}"),
+        };
+        assert_ne!(if_before & 0x1f, 0, "expected at least one pending interrupt");
+
+        // Round-trip through save/restore.
+        let state = emulator.capture_state().expect("capture_state failed");
+        emulator.restore_state(&state);
+
+        // Give the CPU thread time to process the LoadState command.
+        thread::sleep(Duration::from_millis(20));
+
+        let if_after = match await_read(&emulator, 0xff0f) {
+            ReadResult::Ready(v) => v,
+            other => panic!("expected Ready, got {other:?}"),
+        };
+        assert_eq!(
+            if_before & 0x1f,
+            if_after & 0x1f,
+            "IF register not preserved across save/load: before={if_before:#04x}, after={if_after:#04x}"
+        );
     }
 }

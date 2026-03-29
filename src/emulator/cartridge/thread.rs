@@ -244,7 +244,7 @@ impl CartridgeThread {
                 } else {
                     let ram = self.shared_ram_state.as_ref().map(|s| s.ram_mut_slice()).unwrap_or(&mut []);
                     let result = self.controller.write(&self.metadata, ram, address, value);
-                    if matches!(result, WriteResult::Accepted) {
+                    if matches!(result, WriteResult::Accepted) && address < 0xa000 {
                         self.publish_shared_bank_state();
                     }
                     result
