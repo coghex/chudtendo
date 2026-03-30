@@ -195,7 +195,8 @@ impl CpuThread {
                 }
                 // If halted/stopped, still advance the clock so other components progress.
                 if self.cycles == cycles_before {
-                    self.cycles += INSTRUCTIONS_PER_QUANTUM as u64 * 4;
+                    self.cycles += 4;
+                    clock.advance(self.cycles);
                 }
                 clock.advance(self.cycles);
                 // Keep the CPU within one scanline (456 dots) of the PPU.
@@ -236,6 +237,9 @@ impl CpuThread {
 
     fn step(&mut self, inbox: &Receiver<Command>) -> bool {
         let current_pc = self.registers.pc;
+        if matches!(self.state, CoreState::Halted | CoreState::Stopped) {
+            self.wait_for_interrupt_producers_catchup(inbox);
+        }
         let pending_interrupts = self.pending_interrupts();
 
         match self.state {
@@ -248,8 +252,9 @@ impl CpuThread {
                         self.steps = self.steps.wrapping_add(1);
                         return true;
                     }
+                } else {
+                    return false;
                 }
-                return false;
             }
             CoreState::Running => {}
         }
@@ -281,6 +286,16 @@ impl CpuThread {
         self.advance_ime_delay();
         self.advance_serial_transfer();
         self.poll_joypad_interrupt();
+        if matches!(self.state, CoreState::Halted) && self.interrupt_master_enable {
+            self.wait_for_interrupt_producers_catchup(inbox);
+        }
+        let pending_after_step = self.pending_interrupts();
+        if matches!(self.state, CoreState::Halted)
+            && self.interrupt_master_enable
+            && pending_after_step != 0
+        {
+            self.service_interrupt(inbox, pending_after_step);
+        }
         self.last_step_pc = current_pc;
         true
     }
@@ -464,8 +479,9 @@ impl CpuThread {
             }
             0xc0 | 0xc8 | 0xd0 | 0xd8 => {
                 if self.condition((opcode >> 3) & 0x03) {
+                    self.internal_cycle(inbox);
                     self.registers.pc = self.pop_word(inbox);
-                    self.cycles += 8; // taken: 2 internal M-cycles
+                    self.internal_cycle(inbox);
                 }
             }
             0xc1 | 0xd1 | 0xe1 | 0xf1 => {
@@ -483,13 +499,14 @@ impl CpuThread {
             0xc4 | 0xcc | 0xd4 | 0xdc => {
                 let address = self.fetch_word(inbox);
                 if self.condition((opcode >> 3) & 0x03) {
+                    self.internal_cycle(inbox);
                     self.push_word(inbox, self.registers.pc);
                     self.registers.pc = address;
-                    self.cycles += 4; // taken: internal cycle before push
                 }
             }
             0xc5 | 0xd5 | 0xe5 | 0xf5 => {
                 let value = self.stack_reg((opcode >> 4) & 0x03);
+                self.internal_cycle(inbox);
                 self.push_word(inbox, value);
             }
             0xc6 | 0xce | 0xd6 | 0xde | 0xe6 | 0xee | 0xf6 | 0xfe => {
@@ -507,12 +524,14 @@ impl CpuThread {
                 }
             }
             0xc7 | 0xcf | 0xd7 | 0xdf | 0xe7 | 0xef | 0xf7 | 0xff => {
+                self.internal_cycle(inbox);
                 self.push_word(inbox, self.registers.pc);
                 self.registers.pc = (opcode as u16) & 0x0038;
             }
             0xc9 => self.registers.pc = self.pop_word(inbox),
             0xcd => {
                 let address = self.fetch_word(inbox);
+                self.internal_cycle(inbox);
                 self.push_word(inbox, self.registers.pc);
                 self.registers.pc = address;
             }
@@ -566,7 +585,11 @@ impl CpuThread {
                 let value = self.read_byte(inbox, address);
                 self.set_a(value);
             }
-            0xfb => self.ime_enable_delay = 2,
+            0xfb => {
+                if !self.interrupt_master_enable && self.ime_enable_delay == 0 {
+                    self.ime_enable_delay = 2;
+                }
+            }
             _ => {
                 self.state = CoreState::Faulted {
                     opcode,
@@ -622,7 +645,26 @@ impl CpuThread {
     }
 
     fn service_interrupt(&mut self, inbox: &Receiver<Command>, pending_interrupts: u8) {
-        let interrupt_bit = pending_interrupts.trailing_zeros() as u8;
+        self.interrupt_master_enable = false;
+        self.ime_enable_delay = 0;
+        self.state = CoreState::Running;
+        self.internal_cycle(inbox);
+        self.internal_cycle(inbox);
+
+        let [low, high] = self.registers.pc.to_le_bytes();
+        self.registers.sp = self.registers.sp.wrapping_sub(1);
+        self.write_byte_sync(inbox, self.registers.sp, high);
+
+        let pending_after_high = self.pending_interrupts();
+        if pending_after_high == 0 {
+            self.registers.sp = self.registers.sp.wrapping_sub(1);
+            self.write_byte_sync(inbox, self.registers.sp, low);
+            self.internal_cycle(inbox);
+            self.registers.pc = 0x0000;
+            return;
+        }
+
+        let interrupt_bit = pending_after_high.trailing_zeros() as u8;
         let interrupt_mask = 1u8 << interrupt_bit;
         let handler = match interrupt_bit {
             0 => 0x0040,
@@ -633,11 +675,10 @@ impl CpuThread {
             _ => return,
         };
 
-        self.interrupt_master_enable = false;
-        self.ime_enable_delay = 0;
-        self.state = CoreState::Running;
+        self.registers.sp = self.registers.sp.wrapping_sub(1);
+        self.write_byte_sync(inbox, self.registers.sp, low);
+        self.internal_cycle(inbox);
         self.interrupt_flags.clear(interrupt_mask);
-        self.push_word(inbox, self.registers.pc);
         self.registers.pc = handler;
     }
 
@@ -674,6 +715,7 @@ impl CpuThread {
         loop {
             match inbox.try_recv() {
                 Ok(Command::Memory(command)) => self.handle_memory(command),
+                Ok(Command::DivApuEdge) => {}
                 Ok(Command::SetHardwareMode(hardware_mode)) => self.hardware_mode = hardware_mode,
                 Ok(Command::SaveState(respond_to)) => {
                     let state = self.create_save_state();
@@ -769,7 +811,67 @@ impl CpuThread {
         self.pacing_epoch = Some(Instant::now() - std::time::Duration::from_nanos(elapsed_nanos as u64));
     }
 
+    fn wait_for_interrupt_producers_catchup(&mut self, inbox: &Receiver<Command>) {
+        let shared_timer = self.shared_timer.clone();
+        if let Some(shared_timer) = shared_timer {
+            while shared_timer.cycles.load(Ordering::Acquire) < self.cycles {
+                self.service_inbox(inbox);
+                if self.shutdown {
+                    return;
+                }
+                thread::yield_now();
+            }
+        }
+
+        while self.ppu_progress.get() < self.cycles {
+            self.service_inbox(inbox);
+            if self.shutdown {
+                return;
+            }
+            thread::yield_now();
+        }
+    }
+
+    fn wait_for_ppu_catchup(&mut self, inbox: &Receiver<Command>) {
+        while self.ppu_progress.get() < self.cycles {
+            self.service_inbox(inbox);
+            if self.shutdown {
+                break;
+            }
+            thread::yield_now();
+        }
+    }
+
+    fn internal_cycle(&mut self, inbox: &Receiver<Command>) {
+        self.cycles += 4;
+        self.clock.advance(self.cycles);
+        self.service_inbox(inbox);
+    }
+
+    fn is_shared_ppu_address(address: u16) -> bool {
+        matches!(
+            address,
+            0x8000..=0x9fff
+                | 0xfe00..=0xfe9f
+                | 0xff40..=0xff4b
+                | 0xff4f
+                | 0xff51..=0xff55
+                | 0xff68..=0xff6b
+        )
+    }
+
+    fn is_timing_sensitive_shared_ppu_write(address: u16) -> bool {
+        matches!(address, 0x8000..=0x9fff | 0xfe00..=0xfe9f)
+    }
+
     fn read_byte(&mut self, inbox: &Receiver<Command>, address: u16) -> u8 {
+        if address == 0xff0f {
+            self.cycles += 4;
+            self.clock.advance(self.cycles);
+            self.wait_for_interrupt_producers_catchup(inbox);
+            return 0xe0 | self.interrupt_flags.load();
+        }
+
         if let Some(value) = self.read_cpu_owned(address) {
             self.cycles += 4;
             self.clock.advance(self.cycles);
@@ -803,16 +905,51 @@ impl CpuThread {
             }
         }
 
-        if let Some(shared_timer) = &self.shared_timer {
+        let shared_timer = self.shared_timer.clone();
+        if let Some(shared_timer) = shared_timer {
             if matches!(address, 0xff04..=0xff07) {
                 // Advance clock first so the timer sees the current target.
                 self.cycles += 4;
                 self.clock.advance(self.cycles);
                 // Spin until the timer thread has caught up to our clock position.
                 while shared_timer.cycles.load(std::sync::atomic::Ordering::Acquire) < self.cycles {
-                    std::hint::spin_loop();
+                    self.service_inbox(inbox);
+                    if self.shutdown {
+                        return 0xff;
+                    }
+                    thread::yield_now();
                 }
                 return shared_timer.read(address).unwrap_or(0xff);
+            }
+        }
+
+        if address == 0xff26 {
+            self.cycles += 4;
+            self.clock.advance(self.cycles);
+            let shared_timer = self.shared_timer.clone();
+            if let Some(shared_timer) = shared_timer {
+                while shared_timer.cycles.load(Ordering::Acquire) < self.cycles {
+                    self.service_inbox(inbox);
+                    if self.shutdown {
+                        return 0xff;
+                    }
+                    thread::yield_now();
+                }
+            }
+
+            let mut pending = self.bus.read(address);
+            loop {
+                self.service_inbox(inbox);
+                if self.shutdown {
+                    return 0xff;
+                }
+                if let Some(result) = pending.try_take() {
+                    return match result {
+                        ReadResult::Ready(value) => value,
+                        ReadResult::NoData => 0xff,
+                    };
+                }
+                thread::yield_now();
             }
         }
 
@@ -827,6 +964,9 @@ impl CpuThread {
             }
         }
 
+        if Self::is_shared_ppu_address(address) && self.shared_ppu.is_some() {
+            self.wait_for_ppu_catchup(inbox);
+        }
         if let Some(shared_ppu) = &self.shared_ppu {
             if let Some(result) = shared_ppu.read(address) {
                 self.cycles += 4;
@@ -892,6 +1032,9 @@ impl CpuThread {
             }
         }
 
+        if Self::is_timing_sensitive_shared_ppu_write(address) && self.shared_ppu.is_some() {
+            self.wait_for_ppu_catchup(inbox);
+        }
         if let Some(shared_ppu) = &self.shared_ppu {
             if shared_ppu.write(address, value) {
                 self.cycles += 4;
@@ -1215,14 +1358,14 @@ impl CpuThread {
             }
             0xff01 => Some(self.io_registers[0x01]),
             0xff02 => {
-                // SC: bits 2-6 are unused and read as 1.
-                Some(self.io_registers[0x02] | 0x7c)
+                // SC: bits 1-6 are unused and read as 1.
+                Some(self.io_registers[0x02] | 0x7e)
             }
             0xff0f => Some(0xe0 | self.interrupt_flags.load()),
             0xff03 | 0xff08..=0xff0e | 0xff27..=0xff2f | 0xff4e
             | 0xff57..=0xff67 | 0xff6c..=0xff6f | 0xff71..=0xff75
             | 0xff78..=0xff7f => Some(0xff),
-            0xff4c | 0xff56 | 0xff76 | 0xff77 => {
+            0xff4c | 0xff56 => {
                 Some(self.io_registers[(address - 0xff00) as usize])
             }
             0xff80..=0xfffe => Some(self.hram[(address - 0xff80) as usize]),
@@ -1278,7 +1421,8 @@ impl CpuThread {
             | 0xff4c | 0xff4e
             | 0xff56..=0xff67
             | 0xff6c..=0xff6f
-            | 0xff71..=0xff7f => {
+            | 0xff71..=0xff75
+            | 0xff78..=0xff7f => {
                 self.io_registers[(address - 0xff00) as usize] = value;
                 true
             }
@@ -1471,6 +1615,3 @@ fn add_signed_offset(base: u16, offset: i8) -> (u16, bool, bool) {
 fn joypad_select(value: u8) -> u8 {
     value & 0x30
 }
-
-
-

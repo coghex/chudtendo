@@ -81,6 +81,10 @@ impl Bus {
         }
     }
 
+    pub fn apu_sender(&self) -> Sender<Command> {
+        self.apu.clone()
+    }
+
     /// Send SaveState to each component and return one receiver per component.
     /// Order: cpu, ppu, wram, cartridge, timer, apu.
     pub fn save_state_components(
@@ -137,7 +141,7 @@ impl Bus {
             | 0xff68..=0xff6b => Some(&self.ppu),
             0xc000..=0xfdff | 0xff70 => Some(&self.wram),
             0xff04..=0xff07 => Some(&self.timer),
-            0xff10..=0xff26 | 0xff30..=0xff3f => Some(&self.apu),
+            0xff10..=0xff26 | 0xff30..=0xff3f | 0xff76..=0xff77 => Some(&self.apu),
             0xff50 => Some(&self.cartridge),
             0xfea0..=0xfeff => None,
             0xff00..=0xff7f | 0xff80..=0xffff => Some(&self.cpu),

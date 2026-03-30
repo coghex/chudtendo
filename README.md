@@ -75,7 +75,20 @@ ROM-only, MBC1, MBC2, MBC3 (with RTC), MBC5. Battery-backed saves (`.sav` files)
 
 ```
 Blargg:        44/44  (cpu_instrs, instr_timing, mem_timing, cgb_sound, dmg_sound, halt_bug)
-Acid2:          2/2   (cgb-acid2, dmg-acid2)
-Mooneye:       20/62  (bits, instr, timer, interrupts, halt — timing tests require cycle-exact arch)
+Acid2:          3/3   (cgb-acid2, dmg-acid2, mbc3_tester)
+Mooneye:       49/62  (remaining failures are concentrated in interrupt, LCD/STAT, serial, and rapid-toggle timing)
 SameSuite:      1/35  (channel_3_wave_ram_locked_write)
 ```
+
+## Testing Notes
+
+- `.cargo/config.toml` sets `RUST_TEST_THREADS=1` so each test binary runs serially. The emulator spins up multiple worker threads per instance, and parallel Rust test execution causes avoidable contention and intermittent timeouts.
+- `tests/boot_diag.rs` includes a regression test for the missing top `GAME BOY` boot logo during CGB boot.
+- `tests/blargg.rs` includes an ignored stress harness for the historically flaky `cgb_sound/rom_singles/05-sweep details.gb` case:
+
+```bash
+CHUD_STRESS_RUNS=20 CHUD_STRESS_WORKERS=2 \
+  cargo test --test blargg stress_cgb_sound_05_sweep_details -- --ignored --exact --nocapture
+```
+
+The latest isolated stress run passed 20/20, so this currently looks more like a contention-sensitive flake than a deterministic sweep regression.

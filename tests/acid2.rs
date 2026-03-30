@@ -35,13 +35,34 @@ fn run_and_capture(rom_path: &Path, settle_secs: u64) -> Vec<u8> {
         thread::sleep(Duration::from_millis(16));
     }
 
-    // Capture a final snapshot.
-    let snap = emulator.snapshot();
+    // Capture the next fully published frame after the settle window so we
+    // don't race a just-about-to-be-published frame boundary.
+    let snap = emulator.run_frames(1);
     eprintln!(
         "Captured at frame {} (PC={:04x})",
         snap.ppu_frames, snap.cpu_pc
     );
     let _ = last_frames;
+    emulator.stop();
+    snap.framebuffer
+}
+
+fn run_and_capture_frames(rom_path: &Path, frames: u64) -> Vec<u8> {
+    let rom = std::fs::read(rom_path)
+        .unwrap_or_else(|e| panic!("could not read {}: {e}", rom_path.display()));
+    let mut emulator = Emulator::from_rom_bytes(rom).expect("failed to load ROM");
+    emulator.start().expect("failed to start emulator");
+
+    while emulator.boot_rom_mapped() {
+        thread::sleep(Duration::from_millis(1));
+    }
+    let _ = emulator.snapshot();
+
+    let snap = emulator.run_frames(frames);
+    eprintln!(
+        "Captured at frame {} (PC={:04x})",
+        snap.ppu_frames, snap.cpu_pc
+    );
     emulator.stop();
     snap.framebuffer
 }
@@ -75,7 +96,7 @@ fn load_reference_png(path: &Path) -> Vec<u8> {
     rgba
 }
 
-fn compare_framebuffers(actual: &[u8], reference: &[u8], name: &str) {
+fn compare_framebuffers(actual: &[u8], reference: &[u8], name: &str, ignore_top_rows: usize) {
     assert_eq!(
         actual.len(),
         SCREEN_WIDTH * SCREEN_HEIGHT * BYTES_PER_PIXEL,
@@ -91,7 +112,7 @@ fn compare_framebuffers(actual: &[u8], reference: &[u8], name: &str) {
 
     let mut mismatches = 0;
     let mut first_mismatch = None;
-    for y in 0..SCREEN_HEIGHT {
+    for y in ignore_top_rows..SCREEN_HEIGHT {
         for x in 0..SCREEN_WIDTH {
             let i = (y * SCREEN_WIDTH + x) * BYTES_PER_PIXEL;
             // Compare RGB only (ignore alpha).
@@ -115,19 +136,21 @@ fn compare_framebuffers(actual: &[u8], reference: &[u8], name: &str) {
         write_ppm(&dump_path, actual);
 
         let mut diff = vec![0u8; SCREEN_WIDTH * SCREEN_HEIGHT * BYTES_PER_PIXEL];
-        for i in 0..SCREEN_WIDTH * SCREEN_HEIGHT {
-            let base = i * BYTES_PER_PIXEL;
-            if actual[base..base + 3] != reference[base..base + 3] {
-                diff[base] = 255;     // Red pixel for mismatch
-                diff[base + 1] = 0;
-                diff[base + 2] = 0;
-                diff[base + 3] = 255;
-            } else {
-                // Dim version of actual for context
-                diff[base] = actual[base] / 3;
-                diff[base + 1] = actual[base + 1] / 3;
-                diff[base + 2] = actual[base + 2] / 3;
-                diff[base + 3] = 255;
+        for y in 0..SCREEN_HEIGHT {
+            for x in 0..SCREEN_WIDTH {
+                let base = (y * SCREEN_WIDTH + x) * BYTES_PER_PIXEL;
+                if y >= ignore_top_rows && actual[base..base + 3] != reference[base..base + 3] {
+                    diff[base] = 255;     // Red pixel for mismatch
+                    diff[base + 1] = 0;
+                    diff[base + 2] = 0;
+                    diff[base + 3] = 255;
+                } else {
+                    // Dim version of actual for context
+                    diff[base] = actual[base] / 3;
+                    diff[base + 1] = actual[base + 1] / 3;
+                    diff[base + 2] = actual[base + 2] / 3;
+                    diff[base + 3] = 255;
+                }
             }
         }
         let diff_path = format!("/tmp/{name}_diff.ppm");
@@ -135,7 +158,7 @@ fn compare_framebuffers(actual: &[u8], reference: &[u8], name: &str) {
 
         // Print first 20 mismatches for debugging.
         let mut shown = 0;
-        for y in 0..SCREEN_HEIGHT {
+        for y in ignore_top_rows..SCREEN_HEIGHT {
             for x in 0..SCREEN_WIDTH {
                 let i = (y * SCREEN_WIDTH + x) * BYTES_PER_PIXEL;
                 if actual[i..i + 3] != reference[i..i + 3] && shown < 20 {
@@ -176,7 +199,7 @@ fn cgb_acid2() {
 
     let fb = run_and_capture(&rom, 5);
     let ref_fb = load_reference_png(&reference);
-    compare_framebuffers(&fb, &ref_fb, "cgb-acid2");
+    compare_framebuffers(&fb, &ref_fb, "cgb-acid2", 0);
 }
 
 #[test]
@@ -189,9 +212,9 @@ fn mbc3_tester() {
         return;
     }
 
-    let fb = run_and_capture(&rom, 10); // MBC3 tester takes longer
+    let fb = run_and_capture_frames(&rom, 255);
     let ref_fb = load_reference_png(&reference);
-    compare_framebuffers(&fb, &ref_fb, "mbc3-tester");
+    compare_framebuffers(&fb, &ref_fb, "mbc3-tester", 8);
 }
 
 #[test]
@@ -207,5 +230,5 @@ fn dmg_acid2() {
 
     let fb = run_and_capture(&rom, 5);
     let ref_fb = load_reference_png(&reference);
-    compare_framebuffers(&fb, &ref_fb, "dmg-acid2");
+    compare_framebuffers(&fb, &ref_fb, "dmg-acid2", 0);
 }

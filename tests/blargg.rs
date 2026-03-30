@@ -16,6 +16,8 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use chudtendo::emulator::Emulator;
@@ -76,6 +78,7 @@ fn run_blargg_test_mode(rom_path: &Path, dmg_mode: bool) -> TestResult {
     if dmg_mode {
         emulator.set_dmg_mode();
     }
+    emulator.set_speed(0.0);
     let serial_rx = emulator
         .take_serial_receiver()
         .expect("serial receiver unavailable");
@@ -439,6 +442,76 @@ fn cgb_sound_04_sweep() {
 #[test]
 fn cgb_sound_05_sweep_details() {
     assert_blargg_pass("cgb_sound/rom_singles/05-sweep details.gb");
+}
+
+#[test]
+#[ignore]
+fn stress_cgb_sound_05_sweep_details() {
+    fn env_usize(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(default)
+    }
+
+    let path = skip_if_missing("cgb_sound/rom_singles/05-sweep details.gb");
+    let attempts = env_usize("CHUD_STRESS_RUNS", 25);
+    let worker_count = env_usize("CHUD_STRESS_WORKERS", 2);
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut workers = Vec::new();
+
+    for worker_index in 0..worker_count {
+        let stop = stop.clone();
+        workers.push(std::thread::spawn(move || {
+            let mut accumulator = worker_index as u64;
+            while !stop.load(Ordering::Relaxed) {
+                for _ in 0..50_000 {
+                    accumulator = accumulator.wrapping_mul(1664525).wrapping_add(1013904223);
+                    std::hint::spin_loop();
+                }
+                if worker_index % 2 == 0 {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(Duration::from_micros(50));
+                }
+            }
+            accumulator
+        }));
+    }
+
+    let mut failure = None;
+    for attempt in 1..=attempts {
+        let result = run_blargg_test(&path);
+        if result.timed_out || result.failed || !result.passed {
+            failure = Some((attempt, result));
+            break;
+        }
+        eprintln!("stress attempt {attempt}/{attempts}: passed");
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    for worker in workers {
+        let _ = worker.join();
+    }
+
+    if let Some((attempt, result)) = failure {
+        if result.timed_out {
+            panic!(
+                "stress attempt {attempt}/{attempts}: TIMED OUT after {TEST_TIMEOUT:?}\nSerial output:\n{}",
+                result.output
+            );
+        }
+        if result.failed {
+            panic!(
+                "stress attempt {attempt}/{attempts}: FAILED\nSerial output:\n{}",
+                result.output
+            );
+        }
+        panic!(
+            "stress attempt {attempt}/{attempts}: No pass/fail detected\nSerial output:\n{}",
+            result.output
+        );
+    }
 }
 
 #[test]

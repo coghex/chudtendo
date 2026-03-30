@@ -48,6 +48,7 @@ impl WramThread {
             loop {
                 match inbox.try_recv() {
                     Ok(Command::Memory(command)) => self.handle_memory(command),
+                    Ok(Command::DivApuEdge) => {}
                     Ok(Command::SetHardwareMode(hardware_mode)) => {
                         self.hardware_mode = hardware_mode;
                         self.shared.set_hardware_mode(hardware_mode);

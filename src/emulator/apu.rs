@@ -223,7 +223,8 @@ impl ApuThread {
         thread::Builder::new()
             .name("apu".to_owned())
             .spawn(move || {
-                let mut apu = Self::new(sample_sender, clock.clone(), shared, sample_rate, audio_fill_level);
+                let mut apu =
+                    Self::new(sample_sender, clock.clone(), shared, sample_rate, audio_fill_level);
                 apu.hardware_mode = hardware_mode;
                 apu.run(inbox, reports, clock)
             })
@@ -293,6 +294,7 @@ impl ApuThread {
         loop {
             match inbox.try_recv() {
                 Ok(Command::Memory(command)) => self.handle_memory(command),
+                Ok(Command::DivApuEdge) => self.handle_div_apu_edge(),
                 Ok(Command::SetHardwareMode(mode)) => self.hardware_mode = mode,
                 Ok(Command::SaveState(respond_to)) => {
                     let state = self.create_save_state();
@@ -487,7 +489,10 @@ impl ApuThread {
     }
 
     fn chase_clock_for_wave_read(&mut self) {
-        let target = self.clock.target().saturating_sub(6);
+        let target = match self.hardware_mode {
+            HardwareMode::DmgCompatibility => self.clock.target(),
+            HardwareMode::Cgb => self.clock.target().saturating_add(4),
+        };
         while self.cycles < target {
             if self.master_enable {
                 self.tick();
@@ -497,7 +502,17 @@ impl ApuThread {
     }
 
     fn chase_clock_for_wave_write(&mut self) {
-        let target = self.clock.target().saturating_sub(4);
+        let target = self.clock.target();
+        while self.cycles < target {
+            if self.master_enable {
+                self.tick();
+            }
+            self.cycles += 1;
+        }
+    }
+
+    fn chase_clock_for_register_write(&mut self) {
+        let target = self.clock.target().saturating_add(4);
         while self.cycles < target {
             if self.master_enable {
                 self.tick();
@@ -512,12 +527,7 @@ impl ApuThread {
                 address,
                 respond_to,
             } => {
-                if matches!(address, 0xff30..=0xff3f)
-                    && matches!(
-                        self.hardware_mode,
-                        super::component::HardwareMode::DmgCompatibility
-                    )
-                {
+                if matches!(address, 0xff30..=0xff3f) {
                     self.chase_clock_for_wave_read();
                 } else {
                     self.chase_clock();
@@ -530,15 +540,10 @@ impl ApuThread {
                 value,
                 respond_to,
             } => {
-                if matches!(address, 0xff30..=0xff3f)
-                    && matches!(
-                        self.hardware_mode,
-                        super::component::HardwareMode::DmgCompatibility
-                    )
-                {
+                if matches!(address, 0xff30..=0xff3f) {
                     self.chase_clock_for_wave_write();
                 } else {
-                    self.chase_clock();
+                    self.chase_clock_for_register_write();
                 }
                 self.write_register(address, value);
                 self.sync_shared();
@@ -570,10 +575,8 @@ impl ApuThread {
                 if self.channel3.enabled {
                     if matches!(self.hardware_mode, super::component::HardwareMode::DmgCompatibility) {
                         // DMG: CPU can only read wave RAM on the cycle CH3 accesses it.
-                        // Approximate by checking if the period timer just expired.
-                        if self.channel3.period_timer <= 2 {
-                            let idx = (self.channel3.sample_index.wrapping_add(1)) & 31;
-                            ReadResult::Ready(self.wave_ram[(idx / 2) as usize])
+                        if self.channel3.just_accessed_ram {
+                            ReadResult::Ready(self.wave_ram[(self.channel3.sample_index / 2) as usize])
                         } else {
                             ReadResult::Ready(0xff)
                         }
@@ -587,8 +590,26 @@ impl ApuThread {
                     ReadResult::Ready(self.wave_ram[(address - 0xff30) as usize])
                 }
             }
+            0xff76 => ReadResult::Ready(self.pcm12()),
+            0xff77 => ReadResult::Ready(self.pcm34()),
             _ => ReadResult::NoData,
         }
+    }
+
+    fn pcm12(&self) -> u8 {
+        if matches!(self.hardware_mode, HardwareMode::DmgCompatibility) {
+            return 0xff;
+        }
+
+        self.channel1.digital_output() | (self.channel2.digital_output() << 4)
+    }
+
+    fn pcm34(&self) -> u8 {
+        if matches!(self.hardware_mode, HardwareMode::DmgCompatibility) {
+            return 0xff;
+        }
+
+        self.channel3.digital_output() | (self.channel4.digital_output() << 4)
     }
 
     fn write_register(&mut self, address: u16, value: u8) {
@@ -599,7 +620,6 @@ impl ApuThread {
                 if was_enabled && !self.master_enable {
                     self.power_off();
                 } else if !was_enabled && self.master_enable {
-                    self.frame_sequencer_counter = 0;
                     self.frame_sequencer_step = 0;
                 }
             }
@@ -647,9 +667,8 @@ impl ApuThread {
                         super::component::HardwareMode::DmgCompatibility
                     ) {
                         // DMG: write redirects to the byte CH3 is reading, but only
-                        // during the brief cycle when wave RAM is being accessed.
-                        let since_access = self.cycles.wrapping_sub(self.channel3.last_access_cycle);
-                        if since_access <= 2 {
+                        // on the cycle when wave RAM is being accessed.
+                        if self.channel3.just_accessed_ram {
                             self.wave_ram[(self.channel3.sample_index / 2) as usize] = value;
                         }
                     } else {
@@ -1024,22 +1043,14 @@ impl ApuThread {
             self.channel3.length_timer = ch3_len;
             self.channel4.length_timer = ch4_length;
         }
+
+        self.frame_sequencer_step = 0;
     }
 
     fn tick(&mut self) {
         self.frame_sequencer_counter += 1;
         if self.frame_sequencer_counter >= FRAME_SEQUENCER_PERIOD {
             self.frame_sequencer_counter = 0;
-            self.clock_frame_sequencer();
-            // Channel enabled flags may have changed (length counter expiry,
-            // sweep overflow).  Update NR52 so the CPU sees current status.
-            let status = if self.master_enable { 0x80 } else { 0x00 }
-                | if self.channel1.enabled { 0x01 } else { 0x00 }
-                | if self.channel2.enabled { 0x02 } else { 0x00 }
-                | if self.channel3.enabled { 0x04 } else { 0x00 }
-                | if self.channel4.enabled { 0x08 } else { 0x00 };
-            self.shared.set_nr52_status(status);
-            self.shared.set_ch3_enabled(self.channel3.enabled);
         }
 
         // Pulse channels: period timer ticks every 4 T-cycles.
@@ -1052,7 +1063,6 @@ impl ApuThread {
         if self.channel3.just_accessed_ram {
             self.channel3.last_access_cycle = self.cycles;
             self.channel3.last_access_sample_index = self.channel3.sample_index;
-            self.channel3.just_accessed_ram = false;
         }
 
         // Noise channel: ticks at variable rate via period timer.
@@ -1063,6 +1073,20 @@ impl ApuThread {
         if self.sample_counter >= CPU_CLOCK {
             self.sample_counter -= CPU_CLOCK;
             self.emit_sample();
+        }
+    }
+
+    fn handle_div_apu_edge(&mut self) {
+        self.frame_sequencer_counter = 0;
+        if self.master_enable {
+            self.clock_frame_sequencer();
+            let status = if self.master_enable { 0x80 } else { 0x00 }
+                | if self.channel1.enabled { 0x01 } else { 0x00 }
+                | if self.channel2.enabled { 0x02 } else { 0x00 }
+                | if self.channel3.enabled { 0x04 } else { 0x00 }
+                | if self.channel4.enabled { 0x08 } else { 0x00 };
+            self.shared.set_nr52_status(status);
+            self.shared.set_ch3_enabled(self.channel3.enabled);
         }
     }
 
@@ -1214,12 +1238,20 @@ impl PulseChannel {
         if !self.enabled || !self.dac_enabled {
             return 0.0;
         }
-        let digital = if DUTY_TABLE[self.duty as usize][self.duty_position as usize] != 0 {
+        let digital = self.digital_output();
+        digital as f32 * (2.0 / 15.0) - 1.0
+    }
+
+    fn digital_output(&self) -> u8 {
+        if !self.enabled || !self.dac_enabled {
+            return 0;
+        }
+
+        if DUTY_TABLE[self.duty as usize][self.duty_position as usize] != 0 {
             self.volume
         } else {
             0
-        };
-        digital as f32 * (2.0 / 15.0) - 1.0
+        }
     }
 }
 
@@ -1242,6 +1274,7 @@ impl WaveChannel {
     }
 
     fn tick_period(&mut self, wave_ram: &[u8; 16]) {
+        self.just_accessed_ram = false;
         if self.period_timer > 0 {
             self.period_timer -= 1;
         }
@@ -1262,14 +1295,22 @@ impl WaveChannel {
         if !self.enabled || !self.dac_enabled {
             return 0.0;
         }
-        let shifted = match self.output_level {
+        let shifted = self.digital_output();
+        shifted as f32 * (2.0 / 15.0) - 1.0
+    }
+
+    fn digital_output(&self) -> u8 {
+        if !self.enabled || !self.dac_enabled {
+            return 0;
+        }
+
+        match self.output_level {
             0 => 0,
             1 => self.sample_buffer,
             2 => self.sample_buffer >> 1,
             3 => self.sample_buffer >> 2,
             _ => 0,
-        };
-        shifted as f32 * (2.0 / 15.0) - 1.0
+        }
     }
 }
 
@@ -1315,8 +1356,20 @@ impl NoiseChannel {
         if !self.enabled || !self.dac_enabled {
             return 0.0;
         }
-        let digital = if self.lfsr & 1 == 0 { self.volume } else { 0 };
+        let digital = self.digital_output();
         digital as f32 * (2.0 / 15.0) - 1.0
+    }
+
+    fn digital_output(&self) -> u8 {
+        if !self.enabled || !self.dac_enabled {
+            return 0;
+        }
+
+        if self.lfsr & 1 == 0 {
+            self.volume
+        } else {
+            0
+        }
     }
 }
 
@@ -1349,4 +1402,132 @@ fn tick_envelope(volume: &mut u8, direction: bool, pace: u8, timer: &mut u8) {
 enum InboxResult {
     Continue,
     Stop,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    fn test_apu() -> ApuThread {
+        let (sample_sender, _sample_receiver) = mpsc::sync_channel(1);
+        ApuThread::new(
+            sample_sender,
+            MasterClock::new(),
+            SharedApuState::new(),
+            Arc::new(AtomicU32::new(SAMPLE_RATE)),
+            Arc::new(AtomicI32::new(0)),
+        )
+    }
+
+    #[test]
+    fn pcm_registers_pack_cgb_channel_outputs() {
+        let mut apu = test_apu();
+        apu.hardware_mode = HardwareMode::Cgb;
+
+        apu.channel1.enabled = true;
+        apu.channel1.dac_enabled = true;
+        apu.channel1.duty = 2;
+        apu.channel1.duty_position = 0;
+        apu.channel1.volume = 0x0f;
+
+        apu.channel2.enabled = true;
+        apu.channel2.dac_enabled = true;
+        apu.channel2.duty = 2;
+        apu.channel2.duty_position = 0;
+        apu.channel2.volume = 0x09;
+
+        apu.channel3.enabled = true;
+        apu.channel3.dac_enabled = true;
+        apu.channel3.output_level = 1;
+        apu.channel3.sample_buffer = 0x0c;
+
+        apu.channel4.enabled = true;
+        apu.channel4.dac_enabled = true;
+        apu.channel4.volume = 0x05;
+        apu.channel4.lfsr = 0x0000;
+
+        assert_eq!(apu.read_register(0xff76), ReadResult::Ready(0x9f));
+        assert_eq!(apu.read_register(0xff77), ReadResult::Ready(0x5c));
+    }
+
+    #[test]
+    fn pcm_registers_read_ff_in_dmg_compatibility_mode() {
+        let mut apu = test_apu();
+        apu.hardware_mode = HardwareMode::DmgCompatibility;
+
+        apu.channel1.enabled = true;
+        apu.channel1.dac_enabled = true;
+        apu.channel1.duty = 2;
+        apu.channel1.duty_position = 0;
+        apu.channel1.volume = 0x0f;
+
+        apu.channel3.enabled = true;
+        apu.channel3.dac_enabled = true;
+        apu.channel3.output_level = 1;
+        apu.channel3.sample_buffer = 0x0c;
+
+        assert_eq!(apu.read_register(0xff76), ReadResult::Ready(0xff));
+        assert_eq!(apu.read_register(0xff77), ReadResult::Ready(0xff));
+    }
+
+    #[test]
+    fn nrx4_writes_use_end_of_m_cycle_for_extra_length_clock() {
+        let mut apu = test_apu();
+        apu.master_enable = true;
+        apu.frame_sequencer_step = 0;
+        apu.channel1.enabled = true;
+        apu.channel1.length_timer = 1;
+        apu.clock.store(8_189);
+        let (tx, rx) = mpsc::channel();
+        tx.send(Command::DivApuEdge).unwrap();
+        tx.send(Command::Memory(MemoryCommand::Write {
+            address: 0xff14,
+            value: 0x40,
+            respond_to: None,
+        }))
+        .unwrap();
+
+        assert!(matches!(apu.service_inbox(&rx), InboxResult::Continue));
+
+        assert_eq!(apu.cycles, 8_193);
+        assert_eq!(apu.frame_sequencer_step, 1);
+        assert_eq!(apu.channel1.length_timer, 0);
+        assert!(!apu.channel1.enabled);
+    }
+
+    #[test]
+    fn div_apu_edge_clocks_frame_sequencer_only_when_enabled() {
+        let mut apu = test_apu();
+        apu.frame_sequencer_step = 6;
+        apu.handle_div_apu_edge();
+        assert_eq!(apu.frame_sequencer_step, 6);
+
+        apu.master_enable = true;
+        apu.handle_div_apu_edge();
+        assert_eq!(apu.frame_sequencer_counter, 0);
+        assert_eq!(apu.frame_sequencer_step, 7);
+    }
+
+    #[test]
+    fn nr52_high_write_preserves_frame_step_when_already_enabled() {
+        let mut apu = test_apu();
+        apu.hardware_mode = HardwareMode::Cgb;
+        apu.master_enable = true;
+        apu.cycles = 8_189;
+        apu.frame_sequencer_counter = 8_189;
+        apu.frame_sequencer_step = 5;
+        apu.clock.store(8_189);
+
+        apu.handle_memory(MemoryCommand::Write {
+            address: 0xff26,
+            value: 0x80,
+            respond_to: None,
+        });
+
+        assert!(apu.master_enable);
+        assert_eq!(apu.cycles, 8_193);
+        assert_eq!(apu.frame_sequencer_counter, 1);
+        assert_eq!(apu.frame_sequencer_step, 5);
+    }
 }

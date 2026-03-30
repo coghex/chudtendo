@@ -186,6 +186,7 @@ pub struct PpuFeatures {
 #[derive(Debug)]
 pub enum Command {
     Memory(MemoryCommand),
+    DivApuEdge,
     SetHardwareMode(HardwareMode),
     SaveState(std::sync::mpsc::Sender<Vec<u8>>),
     LoadState(Vec<u8>),
@@ -270,6 +271,10 @@ impl SharedCartridgeReadState {
 
     pub fn set_boot_rom_mapped(&self, mapped: bool) {
         self.boot_rom_mapped.store(mapped, Ordering::Release);
+    }
+
+    pub fn boot_rom_mapped(&self) -> bool {
+        self.boot_rom_mapped.load(Ordering::Acquire)
     }
 
     pub fn set_lower_rom_bank(&self, bank: usize) {
@@ -829,33 +834,31 @@ pub struct SharedPpuState {
 }
 
 struct SharedVram {
-    data: std::cell::UnsafeCell<[u8; SHARED_VRAM_BANKS * SHARED_VRAM_BANK_SIZE]>,
+    data: [AtomicU8; SHARED_VRAM_BANKS * SHARED_VRAM_BANK_SIZE],
 }
-unsafe impl Send for SharedVram {}
-unsafe impl Sync for SharedVram {}
 
 impl SharedVram {
     fn new() -> Self {
-        Self { data: std::cell::UnsafeCell::new([0; SHARED_VRAM_BANKS * SHARED_VRAM_BANK_SIZE]) }
-    }
-    fn read(&self, offset: usize) -> u8 {
-        unsafe { (*self.data.get())[offset] }
-    }
-    fn write(&self, offset: usize, value: u8) {
-        unsafe { (*self.data.get())[offset] = value }
-    }
-    fn bank_slice(&self, bank: usize) -> &[u8] {
-        let start = bank * SHARED_VRAM_BANK_SIZE;
-        unsafe {
-            let ptr = self.data.get() as *const u8;
-            std::slice::from_raw_parts(ptr.add(start), SHARED_VRAM_BANK_SIZE)
+        Self {
+            data: std::array::from_fn(|_| AtomicU8::new(0)),
         }
     }
-    fn bank_slice_mut(&self, bank: usize) -> &mut [u8] {
+    fn read(&self, offset: usize) -> u8 {
+        self.data[offset].load(Ordering::Acquire)
+    }
+    fn write(&self, offset: usize, value: u8) {
+        self.data[offset].store(value, Ordering::Release);
+    }
+    fn bank_to_vec(&self, bank: usize) -> Vec<u8> {
         let start = bank * SHARED_VRAM_BANK_SIZE;
-        unsafe {
-            let ptr = self.data.get() as *mut u8;
-            std::slice::from_raw_parts_mut(ptr.add(start), SHARED_VRAM_BANK_SIZE)
+        (start..start + SHARED_VRAM_BANK_SIZE)
+            .map(|offset| self.read(offset))
+            .collect()
+    }
+    fn copy_bank_from_slice(&self, bank: usize, data: &[u8]) {
+        let start = bank * SHARED_VRAM_BANK_SIZE;
+        for (index, value) in data.iter().copied().take(SHARED_VRAM_BANK_SIZE).enumerate() {
+            self.write(start + index, value);
         }
     }
 }
@@ -866,31 +869,27 @@ impl std::fmt::Debug for SharedVram {
 }
 
 struct SharedOam {
-    data: std::cell::UnsafeCell<[u8; SHARED_OAM_SIZE]>,
+    data: [AtomicU8; SHARED_OAM_SIZE],
 }
-unsafe impl Send for SharedOam {}
-unsafe impl Sync for SharedOam {}
 
 impl SharedOam {
     fn new() -> Self {
-        Self { data: std::cell::UnsafeCell::new([0; SHARED_OAM_SIZE]) }
-    }
-    fn read(&self, offset: usize) -> u8 {
-        unsafe { (*self.data.get())[offset] }
-    }
-    fn write(&self, offset: usize, value: u8) {
-        unsafe { (*self.data.get())[offset] = value }
-    }
-    fn as_slice(&self) -> &[u8] {
-        unsafe {
-            let ptr = self.data.get() as *const u8;
-            std::slice::from_raw_parts(ptr, SHARED_OAM_SIZE)
+        Self {
+            data: std::array::from_fn(|_| AtomicU8::new(0)),
         }
     }
-    fn as_mut_slice(&self) -> &mut [u8] {
-        unsafe {
-            let ptr = self.data.get() as *mut u8;
-            std::slice::from_raw_parts_mut(ptr, SHARED_OAM_SIZE)
+    fn read(&self, offset: usize) -> u8 {
+        self.data[offset].load(Ordering::Acquire)
+    }
+    fn write(&self, offset: usize, value: u8) {
+        self.data[offset].store(value, Ordering::Release);
+    }
+    fn to_vec(&self) -> Vec<u8> {
+        (0..SHARED_OAM_SIZE).map(|offset| self.read(offset)).collect()
+    }
+    fn copy_from_slice(&self, data: &[u8]) {
+        for (index, value) in data.iter().copied().take(SHARED_OAM_SIZE).enumerate() {
+            self.write(index, value);
         }
     }
 }
@@ -901,20 +900,20 @@ impl std::fmt::Debug for SharedOam {
 }
 
 struct SharedLcdRegisters {
-    data: std::cell::UnsafeCell<[u8; SHARED_LCD_REGISTERS_LEN]>,
+    data: [AtomicU8; SHARED_LCD_REGISTERS_LEN],
 }
-unsafe impl Send for SharedLcdRegisters {}
-unsafe impl Sync for SharedLcdRegisters {}
 
 impl SharedLcdRegisters {
     fn new() -> Self {
-        Self { data: std::cell::UnsafeCell::new([0; SHARED_LCD_REGISTERS_LEN]) }
+        Self {
+            data: std::array::from_fn(|_| AtomicU8::new(0)),
+        }
     }
     fn read(&self, index: usize) -> u8 {
-        unsafe { (*self.data.get())[index] }
+        self.data[index].load(Ordering::Acquire)
     }
     fn write(&self, index: usize, value: u8) {
-        unsafe { (*self.data.get())[index] = value }
+        self.data[index].store(value, Ordering::Release);
     }
 }
 impl std::fmt::Debug for SharedLcdRegisters {
@@ -1038,22 +1037,23 @@ impl SharedPpuState {
     /// should fall through to the channel.
     pub fn write(&self, address: u16, value: u8) -> bool {
         let lcd_on = self.lcd_enabled.load(Ordering::Acquire);
-        let mode = if lcd_on { self.mode.load(Ordering::Acquire) } else { 0 };
 
         match address {
             0x8000..=0x9fff => {
-                if mode != 3 {
+                if !lcd_on {
                     let bank = self.selected_vram_bank.load(Ordering::Acquire) as usize;
                     let offset = bank * SHARED_VRAM_BANK_SIZE + (address - 0x8000) as usize;
                     self.vram.write(offset, value);
+                    return true;
                 }
-                true // Always "accepted" — matching PPU behavior
+                false
             }
             0xfe00..=0xfe9f => {
-                if !self.oam_dma_active.load(Ordering::Acquire) && mode < 2 {
+                if !lcd_on {
                     self.oam.write((address - 0xfe00) as usize, value);
+                    return true;
                 }
-                true
+                false
             }
             // Side-effect-free LCD register writes: scroll, palettes, window pos.
             0xff42 | 0xff43 | 0xff47..=0xff4b => {
@@ -1072,20 +1072,38 @@ impl SharedPpuState {
 
     // --- PPU-thread-side accessors ---
 
-    pub fn vram_bank_slice(&self, bank: usize) -> &[u8] {
-        self.vram.bank_slice(bank)
+    pub fn vram_read(&self, bank: usize, offset: usize) -> u8 {
+        let offset = bank * SHARED_VRAM_BANK_SIZE + offset;
+        self.vram.read(offset)
     }
 
-    pub fn vram_bank_slice_mut(&self, bank: usize) -> &mut [u8] {
-        self.vram.bank_slice_mut(bank)
+    pub fn vram_write(&self, bank: usize, offset: usize, value: u8) {
+        let offset = bank * SHARED_VRAM_BANK_SIZE + offset;
+        self.vram.write(offset, value);
     }
 
-    pub fn oam_slice(&self) -> &[u8] {
-        self.oam.as_slice()
+    pub fn vram_bank_to_vec(&self, bank: usize) -> Vec<u8> {
+        self.vram.bank_to_vec(bank)
     }
 
-    pub fn oam_mut_slice(&self) -> &mut [u8] {
-        self.oam.as_mut_slice()
+    pub fn copy_vram_bank_from_slice(&self, bank: usize, data: &[u8]) {
+        self.vram.copy_bank_from_slice(bank, data);
+    }
+
+    pub fn oam_read(&self, offset: usize) -> u8 {
+        self.oam.read(offset)
+    }
+
+    pub fn oam_write(&self, offset: usize, value: u8) {
+        self.oam.write(offset, value);
+    }
+
+    pub fn oam_to_vec(&self) -> Vec<u8> {
+        self.oam.to_vec()
+    }
+
+    pub fn copy_oam_from_slice(&self, data: &[u8]) {
+        self.oam.copy_from_slice(data);
     }
 
     pub fn lcd_reg_read(&self, index: usize) -> u8 {
@@ -1110,6 +1128,10 @@ impl SharedPpuState {
 
     pub fn set_selected_vram_bank(&self, bank: u8) {
         self.selected_vram_bank.store(bank, Ordering::Release);
+    }
+
+    pub fn selected_vram_bank(&self) -> u8 {
+        self.selected_vram_bank.load(Ordering::Acquire)
     }
 
     pub fn set_hardware_mode(&self, mode: HardwareMode) {

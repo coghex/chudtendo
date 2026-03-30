@@ -200,7 +200,7 @@ mod tests {
         );
         assert_eq!(
             cartridge_read(&mut cartridge, 0xff50),
-            ReadResult::Ready(0x00)
+            ReadResult::Ready(0xff)
         );
 
         assert_eq!(
@@ -218,7 +218,7 @@ mod tests {
         );
         assert_eq!(
             cartridge_read(&mut cartridge, 0xff50),
-            ReadResult::Ready(0x01)
+            ReadResult::Ready(0xff)
         );
         assert_eq!(
             cartridge_read(&mut cartridge, 0x0000),
@@ -235,7 +235,7 @@ mod tests {
         );
         assert_eq!(
             cartridge_read(&mut cartridge, 0xff50),
-            ReadResult::Ready(0x01)
+            ReadResult::Ready(0xff)
         );
         assert_eq!(
             cartridge_read(&mut cartridge, 0x0000),

@@ -1,0 +1,5 @@
+[env]
+# Each emulator test spawns 6 component threads. Running test binaries in
+# parallel creates 100+ threads competing for CPU, causing intermittent
+# timeouts. Serialize test execution within each binary for reliability.
+RUST_TEST_THREADS = "1"

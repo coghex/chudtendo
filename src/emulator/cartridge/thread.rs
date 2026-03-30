@@ -145,6 +145,7 @@ impl CartridgeThread {
             loop {
                 match inbox.try_recv() {
                     Ok(Command::Memory(command)) => self.handle_memory(command),
+                    Ok(Command::DivApuEdge) => {}
                     Ok(Command::SetHardwareMode(_)) => {}
                     Ok(Command::SaveState(respond_to)) => {
                         let state = save_state::create_save(&self.controller, self.ram(), self.boot_rom_mapped);
@@ -216,7 +217,7 @@ impl CartridgeThread {
                 respond_to,
             } => {
                 let result = if address == 0xff50 {
-                    ReadResult::Ready(if self.boot_rom_mapped { 0x00 } else { 0x01 })
+                    ReadResult::Ready(0xff)
                 } else if self.boot_rom_mapped {
                     if let Some(byte) = self.boot_rom.read(address) {
                         ReadResult::Ready(byte)

@@ -27,6 +27,7 @@ const TIMER_REPORT_INTERVAL: u64 = 1024;
 
 #[derive(Debug)]
 pub struct TimerThread {
+    apu: Sender<Command>,
     interrupt_flags: InterruptFlags,
     clock: MasterClock,
     shared: SharedTimerState,
@@ -38,6 +39,7 @@ pub struct TimerThread {
     cycles: u64,
     system_counter: u16,
     pending_reload: bool,
+    reload_just_happened: bool,
 }
 
 impl TimerThread {
@@ -95,10 +97,20 @@ impl TimerThread {
         self.publish_shared();
     }
 
+    fn chase_clock_for_register_write(&mut self) {
+        let target = self.clock.target().saturating_add(TIMER_CLOCKS_PER_SAMPLE as u64);
+        while self.cycles < target {
+            self.step();
+            self.cycles += TIMER_CLOCKS_PER_SAMPLE as u64;
+        }
+        self.publish_shared();
+    }
+
     fn service_inbox(&mut self, inbox: &Receiver<Command>) -> bool {
         loop {
             match inbox.try_recv() {
                 Ok(Command::Memory(command)) => self.handle_memory(command),
+                Ok(Command::DivApuEdge) => {}
                 Ok(Command::SetHardwareMode(_)) => {}
                 Ok(Command::SaveState(respond_to)) => {
                     let state = self.create_save_state();
@@ -139,6 +151,7 @@ impl TimerThread {
         self.cycles = state.cycles;
         self.system_counter = state.system_counter;
         self.pending_reload = state.pending_reload;
+        self.reload_just_happened = false;
         self.publish_shared();
     }
 
@@ -163,23 +176,32 @@ impl TimerThread {
                 value,
                 respond_to,
             } => {
-                self.chase_clock();
+                self.chase_clock_for_register_write();
                 let result = match address {
                     0xff04 => {
-                        self.apply_counter_change(0, self.tac);
+                        if self.apply_counter_change(0, self.tac) {
+                            self.signal_div_apu_edge();
+                        }
                         WriteResult::Accepted
                     }
                     0xff05 => {
-                        self.pending_reload = false;
-                        self.tima = value;
+                        if !self.reload_just_happened {
+                            self.pending_reload = false;
+                            self.tima = value;
+                        }
                         WriteResult::Accepted
                     }
                     0xff06 => {
                         self.tma = value;
+                        if self.reload_just_happened {
+                            self.tima = value;
+                        }
                         WriteResult::Accepted
                     }
                     0xff07 => {
-                        self.apply_counter_change(self.system_counter, value & 0x07);
+                        if self.apply_counter_change(self.system_counter, value & 0x07) {
+                            self.signal_div_apu_edge();
+                        }
                         WriteResult::Accepted
                     }
                     _ => WriteResult::NoData,
@@ -194,7 +216,7 @@ impl TimerThread {
 
     fn from_init_state(
         init_state: TimerInitState,
-        _bus: Bus,
+        bus: Bus,
         interrupt_flags: InterruptFlags,
         clock: MasterClock,
         shared: SharedTimerState,
@@ -202,32 +224,40 @@ impl TimerThread {
         let tac = init_state.tac & 0x07;
         let tima = init_state.tima;
         let tma = init_state.tma;
-        shared.publish(0, tima, tma, tac, 0);
+        shared.publish(init_state.div, tima, tma, tac, 0);
+        let system_counter = (init_state.div as u16) << 8;
         Self {
+            apu: bus.apu_sender(),
             interrupt_flags,
             clock,
             shared,
-            div: 0,
+            div: init_state.div,
             tima,
             tma,
             tac,
             ticks: 0,
             cycles: 0,
-            system_counter: 0,
+            system_counter,
             pending_reload: false,
+            reload_just_happened: false,
         }
     }
 
     fn step(&mut self) {
         self.ticks = self.ticks.wrapping_add(1);
+        self.reload_just_happened = false;
+        let reloading = self.pending_reload;
 
         let next_counter = self.system_counter.wrapping_add(TIMER_CLOCKS_PER_SAMPLE);
-        self.apply_counter_change(next_counter, self.tac);
+        if self.apply_counter_change(next_counter, self.tac) {
+            self.signal_div_apu_edge();
+        }
 
-        if self.pending_reload {
+        if reloading {
             self.pending_reload = false;
             self.tima = self.tma;
             self.interrupt_flags.set(TIMER_INTERRUPT_MASK);
+            self.reload_just_happened = true;
         }
     }
 
@@ -235,16 +265,24 @@ impl TimerThread {
         self.shared.publish(self.div, self.tima, self.tma, self.tac, self.cycles);
     }
 
-    fn apply_counter_change(&mut self, next_counter: u16, next_tac: u8) {
+    fn signal_div_apu_edge(&self) {
+        let _ = self.apu.send(Command::DivApuEdge);
+    }
+
+    fn apply_counter_change(&mut self, next_counter: u16, next_tac: u8) -> bool {
         let previous_signal = timer_signal(self.system_counter, self.tac);
+        let previous_div_apu = div_apu_signal(self.system_counter);
         self.system_counter = next_counter;
         self.tac = next_tac & 0x07;
         self.div = (self.system_counter >> 8) as u8;
         let next_signal = timer_signal(self.system_counter, self.tac);
+        let next_div_apu = div_apu_signal(self.system_counter);
 
         if previous_signal && !next_signal {
             self.increment_tima();
         }
+
+        previous_div_apu && !next_div_apu
     }
 
     fn increment_tima(&mut self) {
@@ -276,4 +314,48 @@ fn timer_signal(counter: u16, tac: u8) -> bool {
     };
 
     counter & (1 << bit_index) != 0
+}
+
+fn div_apu_signal(counter: u16) -> bool {
+    counter & (1 << 12) != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    fn test_timer(apu: Sender<Command>) -> TimerThread {
+        let (cpu_tx, _cpu_rx) = mpsc::channel();
+        let (ppu_tx, _ppu_rx) = mpsc::channel();
+        let (wram_tx, _wram_rx) = mpsc::channel();
+        let (cart_tx, _cart_rx) = mpsc::channel();
+        let (timer_tx, _timer_rx) = mpsc::channel();
+        let bus = Bus::new(cpu_tx, ppu_tx, wram_tx, cart_tx, timer_tx, apu);
+
+        TimerThread::from_init_state(
+            TimerInitState::default(),
+            bus,
+            InterruptFlags::new(),
+            MasterClock::new(),
+            SharedTimerState::new(),
+        )
+    }
+
+    #[test]
+    fn writing_div_with_bit4_high_emits_div_apu_edge() {
+        let (apu_tx, apu_rx) = mpsc::channel();
+        let mut timer = test_timer(apu_tx);
+        timer.system_counter = 0x1000;
+        timer.div = 0x10;
+
+        timer.handle_memory(MemoryCommand::Write {
+            address: 0xff04,
+            value: 0x00,
+            respond_to: None,
+        });
+
+        assert!(matches!(apu_rx.try_recv(), Ok(Command::DivApuEdge)));
+        assert_eq!(timer.system_counter, 0);
+    }
 }

@@ -189,6 +189,7 @@ pub struct Emulator {
     shared_ppu: Option<SharedPpuState>,
     shared_timer: Option<SharedTimerState>,
     shared_apu: Option<SharedApuState>,
+    shared_cartridge: Option<SharedCartridgeReadState>,
     shared_cartridge_ram: Option<SharedCartridgeRamState>,
     /// Shared sample rate (Hz) — written by the SDL audio callback after
     /// negotiating the actual device rate, read by the APU thread each tick.
@@ -252,6 +253,7 @@ impl Emulator {
             shared_ppu: None,
             shared_timer: None,
             shared_apu: None,
+            shared_cartridge: None,
             shared_cartridge_ram: None,
             sample_rate: Arc::new(AtomicU32::new(48_000)),
             audio_fill_level: Arc::new(AtomicI32::new(0)),
@@ -336,6 +338,7 @@ impl Emulator {
             0,
             1,
         );
+        self.shared_cartridge = Some(shared_cartridge.clone());
         let mut cpu_init = build_cpu_init_state(
             self.config.cartridge.metadata(),
             self.config.boot_seed,
@@ -612,6 +615,12 @@ impl Emulator {
             thread::sleep(Duration::from_millis(1));
         }
         panic!("sync_write timed out at {address:#06x}");
+    }
+
+    pub fn boot_rom_mapped(&self) -> bool {
+        self.shared_cartridge
+            .as_ref()
+            .is_some_and(|shared| shared.boot_rom_mapped())
     }
 
     fn drain_reports(&mut self, context: &str) -> ReportDrainStats {
@@ -1193,7 +1202,7 @@ fn build_ppu_init_state(metadata: &CartridgeMetadata) -> PpuInitState {
 
 fn build_timer_init_state(_metadata: &CartridgeMetadata) -> TimerInitState {
     TimerInitState {
-        div: 0x00,
+        div: 0xab,
         tima: 0x00,
         tma: 0x00,
         tac: 0x00,
@@ -1368,9 +1377,11 @@ mod tests {
 
     fn wait_for_boot_completion(emulator: &mut Emulator) {
         for _ in 0..5000 {
-            if await_read(emulator, 0xff50) == ReadResult::Ready(0x01) {
-                let _ = emulator.snapshot();
-                return;
+            if let Some(shared_cartridge) = &emulator.shared_cartridge {
+                if !shared_cartridge.boot_rom_mapped() {
+                    let _ = emulator.snapshot();
+                    return;
+                }
             }
 
             thread::sleep(Duration::from_millis(1));
@@ -1424,7 +1435,7 @@ mod tests {
 
         assert_eq!(await_read(&emulator, 0x0000), ReadResult::Ready(0x00));
         assert_eq!(await_read(&emulator, 0x0200), ReadResult::Ready(0x00));
-        assert_eq!(await_read(&emulator, 0xff50), ReadResult::Ready(0x01));
+        assert_eq!(await_read(&emulator, 0xff50), ReadResult::Ready(0xff));
         assert_eq!(await_read(&emulator, 0x4000), ReadResult::Ready(0x11));
         assert_eq!(await_write(&emulator, 0x2000, 0x02), WriteResult::Accepted);
         assert_eq!(await_read(&emulator, 0x4000), ReadResult::Ready(0x11));
@@ -1440,6 +1451,41 @@ mod tests {
         assert_eq!(await_read(&emulator, 0xff80), ReadResult::Ready(0x42));
         assert_eq!(await_write(&emulator, 0xffff, 0x1f), WriteResult::Accepted);
         assert_eq!(await_read(&emulator, 0xffff), ReadResult::Ready(0x1f));
+    }
+
+    #[test]
+    fn cgb_pcm_registers_are_apu_owned_and_read_only() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let mut emulator = emulator_with_stopped_cpu();
+        emulator.start().unwrap();
+
+        assert_eq!(await_read(&emulator, 0xff76), ReadResult::Ready(0x00));
+        assert_eq!(await_write(&emulator, 0xff76, 0xaa), WriteResult::Accepted);
+        assert_eq!(await_read(&emulator, 0xff76), ReadResult::Ready(0x00));
+
+        assert_eq!(await_read(&emulator, 0xff77), ReadResult::Ready(0x00));
+        assert_eq!(await_write(&emulator, 0xff77, 0xbb), WriteResult::Accepted);
+        assert_eq!(await_read(&emulator, 0xff77), ReadResult::Ready(0x00));
+    }
+
+    #[test]
+    fn dmg_compatibility_gates_pcm_register_reads() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let cartridge =
+            CartridgeImage::from_bytes(build_test_rom("DMGPCM", 0x00, 0x00, 0x00, 0x00, 0x00))
+                .unwrap();
+        let mut config = EmulatorConfig::with_cartridge(cartridge);
+        config.delays = fast_delays();
+        let mut emulator = Emulator::with_config(config);
+        emulator.set_dmg_mode();
+        start_and_finish_boot(&mut emulator);
+
+        assert_eq!(await_read(&emulator, 0xff76), ReadResult::Ready(0xff));
+        assert_eq!(await_read(&emulator, 0xff77), ReadResult::Ready(0xff));
+        assert_eq!(await_write(&emulator, 0xff76, 0xaa), WriteResult::Accepted);
+        assert_eq!(await_write(&emulator, 0xff77, 0xbb), WriteResult::Accepted);
+        assert_eq!(await_read(&emulator, 0xff76), ReadResult::Ready(0xff));
+        assert_eq!(await_read(&emulator, 0xff77), ReadResult::Ready(0xff));
     }
 
     #[test]
@@ -1473,7 +1519,7 @@ mod tests {
         assert_eq!(await_read(&emulator, 0xff48), ReadResult::Ready(0x00));
         assert_eq!(await_read(&emulator, 0xff49), ReadResult::Ready(0x00));
         assert_eq!(await_read(&emulator, 0xff4f), ReadResult::Ready(0xff));
-        assert_eq!(await_read(&emulator, 0xff50), ReadResult::Ready(0x01));
+        assert_eq!(await_read(&emulator, 0xff50), ReadResult::Ready(0xff));
         assert_eq!(await_read(&emulator, 0xff70), ReadResult::Ready(0xff));
         assert_eq!(await_read(&emulator, 0xffff), ReadResult::Ready(0x00));
 
@@ -1489,6 +1535,77 @@ mod tests {
                 .iter()
                 .any(|sample| *sample != ReadResult::Ready(0x00))
         );
+    }
+
+    fn assert_masked_io_read(
+        emulator: &Emulator,
+        address: u16,
+        mask: u8,
+        write: u8,
+        expected: u8,
+    ) {
+        assert_eq!(await_write(emulator, address, write), WriteResult::Accepted);
+        let value = match await_read(emulator, address) {
+            ReadResult::Ready(value) => value,
+            ReadResult::NoData => panic!("expected readable IO register at {address:04x}"),
+        };
+        assert_eq!(
+            value & mask,
+            expected & mask,
+            "unexpected masked read at {address:04x}: wrote {write:02x}, got {value:02x}, mask {mask:02x}"
+        );
+    }
+
+    #[test]
+    fn dmg_mode_matches_mooneye_unused_hwio_expectations() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let mut config = EmulatorConfig::default();
+        config.delays = fast_delays();
+        let mut emulator = Emulator::with_config(config);
+        emulator.set_dmg_mode();
+        start_and_finish_boot(&mut emulator);
+
+        for &(address, mask, write, expected) in &[
+            (0xff00, 0xc0, 0xff, 0xc0),
+            (0xff00, 0xc0, 0x3f, 0xc0),
+            (0xff02, 0x7e, 0x7e, 0x7e),
+            (0xff02, 0x7e, 0x00, 0x7e),
+            (0xff07, 0xf8, 0xf8, 0xf8),
+            (0xff07, 0xf8, 0x00, 0xf8),
+            (0xff0f, 0xe0, 0xe0, 0xe0),
+            (0xff0f, 0xe0, 0x00, 0xe0),
+            (0xff41, 0x80, 0x80, 0x80),
+            (0xff41, 0x80, 0x00, 0x80),
+            (0xff10, 0x80, 0x00, 0x80),
+            (0xff10, 0x80, 0x80, 0x80),
+            (0xff1a, 0x7f, 0x00, 0x7f),
+            (0xff1a, 0x7f, 0x7f, 0x7f),
+            (0xff1c, 0x9f, 0x00, 0x9f),
+            (0xff1c, 0x9f, 0x9f, 0x9f),
+            (0xff20, 0xc0, 0x00, 0xc0),
+            (0xff20, 0xc0, 0xc0, 0xc0),
+            (0xff23, 0x3f, 0x00, 0x3f),
+            (0xff23, 0x3f, 0x3f, 0x3f),
+            (0xff26, 0x70, 0x80, 0x70),
+            (0xff26, 0x70, 0xf0, 0x70),
+            (0xffff, 0xe0, 0x00, 0x00),
+            (0xffff, 0xe0, 0xe0, 0xe0),
+        ] {
+            assert_masked_io_read(&emulator, address, mask, write, expected);
+        }
+
+        for &address in &[
+            0xff03, 0xff08, 0xff09, 0xff0a, 0xff0b, 0xff0c, 0xff0d, 0xff0e, 0xff15, 0xff1f,
+            0xff27, 0xff28, 0xff29,
+        ] {
+            assert_masked_io_read(&emulator, address, 0xff, 0x00, 0xff);
+            assert_masked_io_read(&emulator, address, 0xff, 0xff, 0xff);
+        }
+
+        for address in 0xff4c..=0xff7f {
+            assert_masked_io_read(&emulator, address, 0xff, 0x00, 0xff);
+            assert_masked_io_read(&emulator, address, 0xff, 0xff, 0xff);
+        }
     }
 
     #[test]
@@ -1630,8 +1747,14 @@ mod tests {
     #[test]
     fn ppu_ff46_dma_copies_source_bytes_into_oam() {
         let _lock = TEST_MUTEX.lock().unwrap();
-        let mut emulator = emulator_with_stopped_cpu();
-        emulator.start().unwrap();
+        let mut rom = build_test_rom("DMA", 0x00, 0x00, 0x01, 0x01, 0x00);
+        rom[0x100] = 0x18;
+        rom[0x101] = 0xfe;
+        let cartridge = CartridgeImage::from_bytes(rom).unwrap();
+        let mut config = EmulatorConfig::with_cartridge(cartridge);
+        config.delays = fast_delays();
+        let mut emulator = Emulator::with_config(config);
+        start_and_finish_boot(&mut emulator);
 
         for offset in 0..0x00a0u16 {
             assert_eq!(
@@ -1787,4 +1910,5 @@ mod tests {
             "IF register not preserved across save/load: before={if_before:#04x}, after={if_after:#04x}"
         );
     }
+
 }

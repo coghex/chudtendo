@@ -36,7 +36,6 @@ const VRAM_BANKS: usize = 2;
 const OAM_SIZE: usize = 0x00a0;
 const OAM_ENTRY_SIZE: usize = 4;
 const MAX_SPRITES: usize = 40;
-const OAM_DMA_BYTES_PER_SAMPLE: usize = 8;
 const LCD_REGISTERS_LEN: usize = 0x0c;
 const HDMA_REGISTERS_LEN: usize = 0x05;
 const PALETTE_RAM_LEN: usize = 0x40;
@@ -129,17 +128,21 @@ pub struct PpuThread {
 // Convenience accessors that route through the shared state.
 // These replace the old owned `vram_banks`, `oam`, and `lcd_registers` fields.
 impl PpuThread {
+    fn selected_vram_bank(&self) -> u8 {
+        self.shared.selected_vram_bank()
+    }
+
     fn vram_read(&self, bank: usize, offset: usize) -> u8 {
-        self.shared.vram_bank_slice(bank)[offset]
+        self.shared.vram_read(bank, offset)
     }
     fn vram_write(&self, bank: usize, offset: usize, value: u8) {
-        self.shared.vram_bank_slice_mut(bank)[offset] = value;
+        self.shared.vram_write(bank, offset, value);
     }
     fn oam_read(&self, offset: usize) -> u8 {
-        self.shared.oam_slice()[offset]
+        self.shared.oam_read(offset)
     }
     fn oam_write(&self, offset: usize, value: u8) {
-        self.shared.oam_mut_slice()[offset] = value;
+        self.shared.oam_write(offset, value);
     }
     fn lcd_reg(&self, index: usize) -> u8 {
         self.shared.lcd_reg_read(index)
@@ -153,7 +156,9 @@ impl PpuThread {
 struct OamDmaTransfer {
     source_base: u16,
     next_index: usize,
-    pending_read: Option<(usize, PendingRead)>,
+    active: bool,
+    dots_until_start: u8,
+    dots_until_byte: u8,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -232,7 +237,6 @@ impl PpuThread {
                 if !self.advance_ppu(&inbox, target) {
                     break;
                 }
-                self.advance_oam_dma();
                 self.refill_spare_framebuffer();
                 self.publish_report_if_needed(&reports);
             } else {
@@ -245,6 +249,7 @@ impl PpuThread {
         loop {
             match inbox.try_recv() {
                 Ok(Command::Memory(command)) => self.handle_memory(command),
+                Ok(Command::DivApuEdge) => {}
                 Ok(Command::SetHardwareMode(hardware_mode)) => {
                     self.hardware_mode = hardware_mode;
                     self.shared.set_hardware_mode(hardware_mode);
@@ -264,7 +269,7 @@ impl PpuThread {
                 }
                 Ok(Command::RequestPpuFeatures(respond_to)) => {
                     let mut oam_copy = [0u8; 160];
-                    oam_copy.copy_from_slice(&self.shared.oam_slice()[..160]);
+                    oam_copy.copy_from_slice(&self.shared.oam_to_vec()[..160]);
                     let features = super::component::PpuFeatures {
                         oam: oam_copy,
                         lcdc: self.lcd_reg(LCDC_INDEX),
@@ -286,9 +291,11 @@ impl PpuThread {
 
     fn create_save_state(&self) -> PpuSaveState {
         PpuSaveState {
-            vram_banks: (0..VRAM_BANKS).map(|b| self.shared.vram_bank_slice(b).to_vec()).collect(),
+            vram_banks: (0..VRAM_BANKS)
+                .map(|b| self.shared.vram_bank_to_vec(b))
+                .collect(),
             selected_vram_bank: self.selected_vram_bank,
-            oam: self.shared.oam_slice().to_vec(),
+            oam: self.shared.oam_to_vec(),
             lcd_registers: (0..LCD_REGISTERS_LEN).map(|i| self.lcd_reg(i)).collect(),
             hdma_registers: self.hdma_registers.to_vec(),
             bg_palette_index: self.bg_palette_index,
@@ -308,15 +315,12 @@ impl PpuThread {
     fn apply_save_state(&mut self, state: PpuSaveState) {
         for (bank_idx, bank_data) in state.vram_banks.iter().enumerate() {
             if bank_idx < VRAM_BANKS {
-                let dest = self.shared.vram_bank_slice_mut(bank_idx);
-                let len = bank_data.len().min(VRAM_BANK_SIZE);
-                dest[..len].copy_from_slice(&bank_data[..len]);
+                self.shared.copy_vram_bank_from_slice(bank_idx, bank_data);
             }
         }
         self.selected_vram_bank = state.selected_vram_bank;
         self.shared.set_selected_vram_bank(state.selected_vram_bank);
-        let len = state.oam.len().min(OAM_SIZE);
-        self.shared.oam_mut_slice()[..len].copy_from_slice(&state.oam[..len]);
+        self.shared.copy_oam_from_slice(&state.oam);
         let len = state.lcd_registers.len().min(LCD_REGISTERS_LEN);
         for i in 0..len {
             self.set_lcd_reg(i, state.lcd_registers[i]);
@@ -374,12 +378,12 @@ impl PpuThread {
                             ReadResult::Ready(0xff)
                         } else {
                             ReadResult::Ready(
-                                self.vram_read(self.selected_vram_bank as usize, (address - 0x8000) as usize),
+                                self.vram_read(self.selected_vram_bank() as usize, (address - 0x8000) as usize),
                             )
                         }
                     }
                     0xfe00..=0xfe9f => {
-                        if self.oam_dma.is_some() || mode >= 2 {
+                        if self.oam_dma_active() || mode >= 2 {
                             ReadResult::Ready(0xff)
                         } else {
                             ReadResult::Ready(self.oam_read((address - 0xfe00) as usize))
@@ -391,7 +395,7 @@ impl PpuThread {
                     0xff4f if matches!(self.hardware_mode, HardwareMode::DmgCompatibility) => {
                         ReadResult::Ready(0xff)
                     }
-                    0xff4f => ReadResult::Ready(0xfe | self.selected_vram_bank),
+                    0xff4f => ReadResult::Ready(0xfe | self.selected_vram_bank()),
                     0xff51..=0xff55
                         if matches!(self.hardware_mode, HardwareMode::DmgCompatibility) =>
                     {
@@ -433,7 +437,7 @@ impl PpuThread {
                 let result = match address {
                     0x8000..=0x9fff => {
                         if mode != 3 {
-                            self.vram_write(self.selected_vram_bank as usize, (address - 0x8000) as usize, value);
+                            self.vram_write(self.selected_vram_bank() as usize, (address - 0x8000) as usize, value);
                             trace_ppu_memory_write(
                                 self.frames,
                                 address,
@@ -441,7 +445,7 @@ impl PpuThread {
                                 self.lcd_reg(LY_INDEX),
                                 self.dots_into_line,
                                 mode,
-                                if self.selected_vram_bank == 0 {
+                                if self.selected_vram_bank() == 0 {
                                     "vram0"
                                 } else {
                                     "vram1"
@@ -451,7 +455,7 @@ impl PpuThread {
                         WriteResult::Accepted
                     }
                     0xfe00..=0xfe9f => {
-                        if self.oam_dma.is_none() && mode < 2 {
+                        if !self.oam_dma_active() && mode < 2 {
                             self.oam_write((address - 0xfe00) as usize, value);
                             trace_ppu_memory_write(
                                 self.frames,
@@ -525,6 +529,7 @@ impl PpuThread {
                         WriteResult::Accepted
                     }
                     0xff46 => {
+                        self.chase_clock();
                         self.set_lcd_reg((address - 0xff40) as usize, value);
                         trace_ppu_memory_write(
                             self.frames,
@@ -672,7 +677,7 @@ impl PpuThread {
         shared: super::component::SharedPpuState,
     ) -> Self {
         // Populate shared state from init_state
-        shared.oam_mut_slice()[..OAM_SIZE].copy_from_slice(&init_state.oam);
+        shared.copy_oam_from_slice(&init_state.oam);
         for (i, &v) in init_state.lcd_registers.iter().enumerate() {
             shared.lcd_reg_write(i, v);
         }
@@ -752,6 +757,8 @@ impl PpuThread {
     }
 
     fn step_dot(&mut self) {
+        self.step_oam_dma_dot();
+
         if !self.lcd_enabled() {
             self.set_lcd_reg(LY_INDEX, 0);
             self.dots_into_line = 0;
@@ -911,7 +918,7 @@ impl PpuThread {
 
         let _ = reports.send(ComponentReport::Ppu(PpuReport {
             frames: self.frames,
-            selected_vram_bank: self.selected_vram_bank,
+            selected_vram_bank: self.selected_vram_bank(),
             framebuffer,
         }));
         self.report_dirty = false;
@@ -1030,7 +1037,7 @@ impl PpuThread {
             for i in 0..16u16 {
                 let byte = self.bus_read_hdma(source.wrapping_add(i));
                 let dest_addr = destination.wrapping_add(i);
-                let bank = self.selected_vram_bank as usize;
+                let bank = self.selected_vram_bank() as usize;
                 let offset = (dest_addr & 0x1fff) as usize;
                 if offset < VRAM_BANK_SIZE {
                     self.vram_write(bank, offset, byte);
@@ -1055,7 +1062,7 @@ impl PpuThread {
         for i in 0..16u16 {
             let byte = self.bus_read_hdma(hdma.source.wrapping_add(i));
             let dest_addr = hdma.destination.wrapping_add(i);
-            let bank = self.selected_vram_bank as usize;
+            let bank = self.selected_vram_bank() as usize;
             let offset = (dest_addr & 0x1fff) as usize;
             if offset < VRAM_BANK_SIZE {
                 self.vram_write(bank, offset, byte);
@@ -1091,66 +1098,100 @@ impl PpuThread {
     }
 
     fn start_oam_dma(&mut self, source_high: u8) {
+        let already_active = self.oam_dma.as_ref().is_some_and(|dma| dma.active);
         self.oam_dma = Some(OamDmaTransfer {
             source_base: u16::from(source_high) << 8,
             next_index: 0,
-            pending_read: None,
+            active: already_active,
+            dots_until_start: 4,
+            dots_until_byte: 0,
         });
-        self.shared.set_oam_dma_active(true);
+        if already_active {
+            self.shared.set_oam_dma_active(true);
+        }
     }
 
-    fn advance_oam_dma(&mut self) {
-        let mut transferred = 0;
-
-        while transferred < OAM_DMA_BYTES_PER_SAMPLE {
-            let ly = self.lcd_reg(LY_INDEX);
-            let dots = self.dots_into_line;
-            let mode = self.current_mode();
+    fn step_oam_dma_dot(&mut self) {
+        let Some((index, address)) = ({
             let Some(dma) = self.oam_dma.as_mut() else {
                 return;
             };
 
-            if let Some((index, mut pending_read)) = dma.pending_read.take() {
-                let Some(result) = pending_read.try_take() else {
-                    dma.pending_read = Some((index, pending_read));
-                    return;
-                };
-                let value = match result {
-                    ReadResult::Ready(value) => value,
-                    ReadResult::NoData => 0xff,
-                };
-
-                self.shared.oam_mut_slice()[index] = value;
-                dma.next_index = index + 1;
-                trace_ppu_memory_write(
-                    self.frames,
-                    0xfe00 + index as u16,
-                    value,
-                    ly,
-                    dots,
-                    mode,
-                    "dma",
-                );
-                transferred += 1;
-
-                if dma.next_index >= OAM_SIZE {
-                    self.oam_dma = None;
-                    self.shared.set_oam_dma_active(false);
-                    return;
-                }
-
-                continue;
-            }
-
-            if dma.next_index >= OAM_SIZE {
-                self.oam_dma = None;
-                self.shared.set_oam_dma_active(false);
+            if dma.dots_until_start != 0 {
+                dma.dots_until_start = dma.dots_until_start.saturating_sub(1);
                 return;
             }
 
-            let index = dma.next_index;
-            let address = dma.source_base.wrapping_add(index as u16);
-            dma.pending_read = Some((index, self.bus.read(address)));
+            dma.dots_until_byte = dma.dots_until_byte.saturating_sub(1);
+            if dma.dots_until_byte != 0 {
+                None
+            } else if dma.next_index >= OAM_SIZE {
+                self.oam_dma = None;
+                self.shared.set_oam_dma_active(false);
+                return;
+            } else {
+                dma.dots_until_byte = 4;
+                let index = dma.next_index;
+                dma.next_index += 1;
+                Some((index, dma.source_base.wrapping_add(index as u16)))
+            }
+        }) else {
+            return;
+        };
+
+        let value = self.read_oam_dma_source(address);
+        let became_active = if let Some(dma) = self.oam_dma.as_mut() {
+            if !dma.active {
+                dma.active = true;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if became_active {
+            self.shared.set_oam_dma_active(true);
+        }
+        self.shared.oam_write(index, value);
+        trace_ppu_memory_write(
+            self.frames,
+            0xfe00 + index as u16,
+            value,
+            self.lcd_reg(LY_INDEX),
+            self.dots_into_line,
+            self.current_mode(),
+            "dma",
+        );
+
+    }
+
+    fn oam_dma_active(&self) -> bool {
+        self.oam_dma
+            .as_ref()
+            .is_some_and(|dma| dma.active)
+    }
+
+    fn read_oam_dma_source(&self, address: u16) -> u8 {
+        let address = if address >= 0xe000 {
+            address - 0x2000
+        } else {
+            address
+        };
+
+        if matches!(address, 0x8000..=0x9fff) {
+            return self.vram_read(self.selected_vram_bank() as usize, (address - 0x8000) as usize);
+        }
+
+        let mut pending = self.bus.read(address);
+        loop {
+            if let Some(result) = pending.try_take() {
+                return match result {
+                    ReadResult::Ready(value) => value,
+                    ReadResult::NoData => 0xff,
+                };
+            }
+            std::thread::yield_now();
         }
     }
 
