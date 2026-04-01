@@ -286,7 +286,9 @@ impl CpuThread {
         self.advance_ime_delay();
         self.advance_serial_transfer();
         self.poll_joypad_interrupt();
-        if matches!(self.state, CoreState::Halted) && self.interrupt_master_enable {
+        if matches!(self.state, CoreState::Halted | CoreState::Stopped)
+            && self.interrupt_master_enable
+        {
             self.wait_for_interrupt_producers_catchup(inbox);
         }
         let pending_after_step = self.pending_interrupts();
@@ -392,6 +394,9 @@ impl CpuThread {
                 if self.condition((opcode >> 3) & 0x03) {
                     self.registers.pc = self.registers.pc.wrapping_add_signed(offset as i16);
                     self.cycles += 4;
+                    if self.interrupt_master_enable {
+                        self.clock.advance(self.cycles);
+                    }
                 }
             }
             0x22 => {
@@ -433,6 +438,9 @@ impl CpuThread {
             }
             0x40..=0x7f => {
                 if opcode == 0x76 {
+                    if !self.interrupt_master_enable {
+                        self.wait_for_interrupt_producers_catchup(inbox);
+                    }
                     if !self.interrupt_master_enable && self.pending_interrupts() != 0 {
                         self.halt_bug = true;
                     } else {
@@ -493,6 +501,9 @@ impl CpuThread {
                 if self.condition((opcode >> 3) & 0x03) {
                     self.registers.pc = address;
                     self.cycles += 4; // taken: internal jump cycle
+                    if self.interrupt_master_enable {
+                        self.clock.advance(self.cycles);
+                    }
                 }
             }
             0xc3 => self.registers.pc = self.fetch_word(inbox),
@@ -988,10 +999,11 @@ impl CpuThread {
             if let Some(result) = pending.try_take() {
                 self.cycles += 4;
                 self.clock.advance(self.cycles);
-                return match result {
+                let value = match result {
                     ReadResult::Ready(value) => value,
                     ReadResult::NoData => 0xff,
                 };
+                return value;
             }
             thread::yield_now();
         }

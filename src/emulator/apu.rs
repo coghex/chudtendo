@@ -1,6 +1,4 @@
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering as AtomicOrdering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError};
-use std::sync::Arc;
 use std::thread;
 
 use serde::{Deserialize, Serialize};
@@ -145,11 +143,6 @@ pub struct ApuThread {
     sample_counter: u32,
     samples_emitted: u64,
     sample_sender: SyncSender<[f32; 2]>,
-    /// Dynamic sample rate (Hz), adjusted by the SDL audio callback's
-    /// adaptive rate control loop to keep the producer and consumer in sync.
-    sample_rate: Arc<AtomicU32>,
-    /// Approximate fill level of the audio channel — shared with the callback.
-    audio_fill_level: Arc<AtomicI32>,
     /// First-order high-pass filter state (capacitor coupling).
     /// Removes DC offset, matching the Game Boy's analog output stage.
     hpf_left: f32,
@@ -217,14 +210,11 @@ impl ApuThread {
         clock: MasterClock,
         hardware_mode: super::component::HardwareMode,
         shared: SharedApuState,
-        sample_rate: Arc<AtomicU32>,
-        audio_fill_level: Arc<AtomicI32>,
     ) -> thread::JoinHandle<()> {
         thread::Builder::new()
             .name("apu".to_owned())
             .spawn(move || {
-                let mut apu =
-                    Self::new(sample_sender, clock.clone(), shared, sample_rate, audio_fill_level);
+                let mut apu = Self::new(sample_sender, clock.clone(), shared);
                 apu.hardware_mode = hardware_mode;
                 apu.run(inbox, reports, clock)
             })
@@ -235,8 +225,6 @@ impl ApuThread {
         sample_sender: SyncSender<[f32; 2]>,
         clock: MasterClock,
         shared: SharedApuState,
-        sample_rate: Arc<AtomicU32>,
-        audio_fill_level: Arc<AtomicI32>,
     ) -> Self {
         Self {
             clock,
@@ -257,8 +245,6 @@ impl ApuThread {
             sample_counter: 0,
             samples_emitted: 0,
             sample_sender,
-            sample_rate,
-            audio_fill_level,
             hpf_left: 0.0,
             hpf_right: 0.0,
         }
@@ -276,7 +262,7 @@ impl ApuThread {
                 InboxResult::Stop => break,
             }
             // Independently chase close to the master clock so audio samples
-            // are generated at a steady rate.  Stop 8 cycles short so the
+            // are generated at a steady rate. Stop 8 cycles short so the
             // wave-specific offset chases in handle_memory still have room
             // to position the APU precisely for DMG wave access timing.
             let target = self.clock.target().saturating_sub(8);
@@ -1068,8 +1054,7 @@ impl ApuThread {
         // Noise channel: ticks at variable rate via period timer.
         self.channel4.tick_period();
 
-        let rate = self.sample_rate.load(AtomicOrdering::Relaxed);
-        self.sample_counter += rate;
+        self.sample_counter += SAMPLE_RATE;
         if self.sample_counter >= CPU_CLOCK {
             self.sample_counter -= CPU_CLOCK;
             self.emit_sample();
@@ -1193,9 +1178,7 @@ impl ApuThread {
         self.hpf_right += hpf_right_out * HPF_DECAY;
 
         self.samples_emitted += 1;
-        if self.sample_sender.try_send([hpf_left_out, hpf_right_out]).is_ok() {
-            self.audio_fill_level.fetch_add(1, AtomicOrdering::Relaxed);
-        }
+        let _ = self.sample_sender.try_send([hpf_left_out, hpf_right_out]);
     }
 }
 

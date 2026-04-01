@@ -8,16 +8,9 @@ mod timer;
 mod wram;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, AtomicU32};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-
-/// Size of the bounded audio sample channel (in stereo sample pairs).
-/// ~85 ms of audio at 48 kHz — large enough for the adaptive rate control
-/// loop to absorb transient scheduling jitter without overflow or underflow.
-pub(crate) const AUDIO_BUFFER_CAPACITY: usize = 4096;
 
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
@@ -191,13 +184,6 @@ pub struct Emulator {
     shared_apu: Option<SharedApuState>,
     shared_cartridge: Option<SharedCartridgeReadState>,
     shared_cartridge_ram: Option<SharedCartridgeRamState>,
-    /// Shared sample rate (Hz) — written by the SDL audio callback after
-    /// negotiating the actual device rate, read by the APU thread each tick.
-    sample_rate: Arc<AtomicU32>,
-    /// Approximate number of stereo samples currently in the audio channel.
-    /// Incremented by the APU on successful send, decremented by the SDL
-    /// callback on successful receive. Used by the adaptive rate control loop.
-    audio_fill_level: Arc<AtomicI32>,
 }
 
 impl Emulator {
@@ -213,7 +199,7 @@ impl Emulator {
         let (timer_sender, timer_receiver) = mpsc::channel();
         let (apu_sender, apu_receiver) = mpsc::channel();
         let (_report_sender, report_receiver) = mpsc::channel();
-        let (sample_sender, sample_receiver) = mpsc::sync_channel(AUDIO_BUFFER_CAPACITY);
+        let (sample_sender, sample_receiver) = mpsc::sync_channel(2048);
         let (serial_out_sender, serial_out_receiver) = mpsc::sync_channel(4096);
 
         Self {
@@ -255,8 +241,6 @@ impl Emulator {
             shared_apu: None,
             shared_cartridge: None,
             shared_cartridge_ram: None,
-            sample_rate: Arc::new(AtomicU32::new(48_000)),
-            audio_fill_level: Arc::new(AtomicI32::new(0)),
         }
     }
 
@@ -288,20 +272,7 @@ impl Emulator {
     }
 
     pub fn take_sample_receiver(&mut self) -> Option<Receiver<[f32; 2]>> {
-        self.audio_fill_level.store(0, std::sync::atomic::Ordering::Relaxed);
         self.sample_ready.take()
-    }
-
-    pub fn sample_rate_shared(&self) -> Arc<AtomicU32> {
-        self.sample_rate.clone()
-    }
-
-    pub fn audio_fill_level_shared(&self) -> Arc<AtomicI32> {
-        self.audio_fill_level.clone()
-    }
-
-    pub fn set_sample_rate(&self, rate: u32) {
-        self.sample_rate.store(rate, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn take_serial_receiver(&mut self) -> Option<Receiver<u8>> {
@@ -522,8 +493,6 @@ impl Emulator {
                     HardwareMode::Cgb
                 },
                 shared_apu,
-                self.sample_rate.clone(),
-                self.audio_fill_level.clone(),
             ),
         });
 
